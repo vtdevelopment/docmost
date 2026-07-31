@@ -346,6 +346,20 @@ export class EnvironmentService {
     return disabled === 'true';
   }
 
+  /**
+   * Enables the self-hosted OIDC single sign-on built into this fork.
+   *
+   * Opt-in so the default build behaves exactly as upstream. When on, it makes
+   * LicenseCheckService report the two features the SSO admin UI is gated on
+   * (see selfBuiltFeatures there).
+   */
+  isSsoOidcEnabled(): boolean {
+    const enabled = this.configService
+      .get<string>('SSO_OIDC_ENABLED', 'false')
+      .toLowerCase();
+    return enabled === 'true';
+  }
+
   isIframeEmbedAllowed(): boolean {
     const allowed = this.configService
       .get<string>('IFRAME_EMBED_ALLOWED', 'false')
