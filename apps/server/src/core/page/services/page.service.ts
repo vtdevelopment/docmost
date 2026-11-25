@@ -1,5 +1,7 @@
+import { isDeepStrictEqual } from 'node:util';
 import {
   BadRequestException,
+  ConflictException,
   Injectable,
   Logger,
   NotFoundException,
@@ -8,7 +10,13 @@ import { CreatePageDto, ContentFormat } from '../dto/create-page.dto';
 import { ContentOperation, UpdatePageDto } from '../dto/update-page.dto';
 import { PageRepo } from '@docmost/db/repos/page/page.repo';
 import { PagePermissionRepo } from '@docmost/db/repos/page/page-permission.repo';
-import { InsertablePage, Page, User } from '@docmost/db/types/entity.types';
+import {
+  InsertablePage,
+  Page,
+  Share,
+  UpdatablePage,
+  User,
+} from '@docmost/db/types/entity.types';
 import { PaginationOptions } from '@docmost/db/pagination/pagination-options';
 import {
   CursorPaginationResult,
@@ -20,25 +28,25 @@ import { generateJitteredKeyBetween } from 'fractional-indexing-jittered';
 import { MovePageDto } from '../dto/move-page.dto';
 import { generateSlugId } from '../../../common/helpers';
 import { getPageTitle } from '../../../common/helpers';
-import { executeTx } from '@docmost/db/utils';
+import { dbOrTx, executeTx } from '@docmost/db/utils';
 import { AttachmentRepo } from '@docmost/db/repos/attachment/attachment.repo';
 import { v7 as uuid7 } from 'uuid';
 import {
   createYdocFromJson,
   getAttachmentIds,
   getProsemirrorContent,
-  isAttachmentNode,
+  replaceAttachmentIds,
   removeMarkTypeFromDoc,
 } from '../../../common/helpers/prosemirror/utils';
 import {
   htmlToJson,
   jsonToNode,
   jsonToText,
+  parseDocumentJson,
+  templateExtensions,
+  tiptapExtensions,
 } from 'src/collaboration/collaboration.util';
-import {
-  CopyPageMapEntry,
-  ICopyPageAttachment,
-} from '../dto/duplicate-page.dto';
+import { CopyPageMapEntry } from '../dto/duplicate-page.dto';
 import { Node as PMNode } from '@tiptap/pm/model';
 import { StorageService } from '../../../integrations/storage/storage.service';
 import { InjectQueue } from '@nestjs/bullmq';
@@ -55,6 +63,24 @@ import { markdownToHtml } from '@docmost/editor-ext';
 import { WatcherService } from '../../watcher/watcher.service';
 import { sql } from 'kysely';
 import { TransclusionService } from '../transclusion/transclusion.service';
+import { LabelRepo } from '@docmost/db/repos/label/label.repo';
+import { WsService } from '../../../ws/ws.service';
+import { CollabAccessService } from '../../../collaboration/services/collab-access.service';
+import { ShareService } from '../../share/share.service';
+import {
+  buildCoverFileUrl,
+  getCoverAttachmentId,
+  getUnsplashPhotoId,
+  isPresetCover,
+  queueCoverCleanup,
+  remapCopiedCover,
+} from '../page-cover.utils';
+import { COVER_IMAGE_MIME_TYPES } from '../page-cover.constants';
+import { CoverFields } from '../page-cover.types';
+import { UnsplashService } from '../../../integrations/unsplash/unsplash.service';
+import { AttachmentType } from '../../attachment/attachment.constants';
+import { PageVerificationInvalidationService } from '../verification/page-verification-invalidation.service';
+import { isSameTitle } from '../verification/page-verification-invalidation.utils';
 
 @Injectable()
 export class PageService {
@@ -73,6 +99,12 @@ export class PageService {
     private collaborationGateway: CollaborationGateway,
     private readonly watcherService: WatcherService,
     private readonly transclusionService: TransclusionService,
+    private readonly labelRepo: LabelRepo,
+    private readonly wsService: WsService,
+    private readonly collabAccessService: CollabAccessService,
+    private readonly shareService: ShareService,
+    private readonly unsplashService: UnsplashService,
+    private readonly pageVerificationInvalidationService: PageVerificationInvalidationService,
   ) {}
 
   async findById(
@@ -174,10 +206,14 @@ export class PageService {
     return page;
   }
 
-  async nextPagePosition(spaceId: string, parentPageId?: string) {
+  async nextPagePosition(
+    spaceId: string,
+    parentPageId?: string,
+    trx?: KyselyTransaction,
+  ) {
     let pagePosition: string;
 
-    const lastPageQuery = this.db
+    const lastPageQuery = dbOrTx(this.db, trx)
       .selectFrom('pages')
       .select(['position'])
       .where('spaceId', '=', spaceId)
@@ -220,44 +256,99 @@ export class PageService {
     updatePageDto: UpdatePageDto,
     user: User,
   ): Promise<Page> {
-    const contributors = new Set<string>(page.contributorIds);
-    contributors.add(user.id);
-    const contributorIds = Array.from(contributors);
-
-    await this.pageRepo.updatePage(
-      {
-        title: updatePageDto.title,
-        icon: updatePageDto.icon,
-        lastUpdatedById: user.id,
-        updatedAt: new Date(),
-        contributorIds: contributorIds,
-      },
-      page.id,
+    const { title, icon, content, operation, format } = updatePageDto;
+    const hasContentUpdate = Boolean(content && operation && format);
+    const coverFields = await this.resolveCoverFields(
+      page,
+      updatePageDto,
+      user,
     );
+    const otherFields = { icon, ...coverFields };
 
-    this.generalQueue
-      .add(QueueJob.ADD_PAGE_WATCHERS, {
-        userIds: [user.id],
-        pageId: page.id,
-        spaceId: page.spaceId,
-        workspaceId: page.workspaceId,
-      })
-      .catch((err) =>
-        this.logger.warn(`Failed to queue add-page-watchers: ${err.message}`),
+    const edit = await executeTx(this.db, async (trx) => {
+      const current = await this.pageRepo.findById(page.id, {
+        withLock: true,
+        trx,
+      });
+      if (!current) throw new NotFoundException('Page not found');
+
+      const titleChanged =
+        title !== undefined && !isSameTitle(current.title, title);
+      const otherFieldsChanged = Object.entries(otherFields).some(
+        ([key, value]) =>
+          value !== undefined && !isDeepStrictEqual(current[key], value),
       );
+      if (title !== undefined && !titleChanged && !otherFieldsChanged) {
+        if (current.title !== title) {
+          // Save the literal spacing without including updatedAt in the SQL update.
+          await this.pageRepo.updatePage(
+            { title, updatedAt: undefined },
+            page.id,
+            trx,
+          );
+        }
+        return null;
+      }
 
-    if (
-      updatePageDto.content &&
-      updatePageDto.operation &&
-      updatePageDto.format
-    ) {
-      await this.updatePageContent(
+      const contributors = new Set(current.contributorIds);
+      contributors.add(user.id);
+      await this.pageRepo.updatePage(
+        {
+          title,
+          ...otherFields,
+          lastUpdatedById: user.id,
+          contributorIds: Array.from(contributors),
+        },
         page.id,
-        updatePageDto.content,
-        updatePageDto.operation,
-        updatePageDto.format,
-        user,
+        trx,
       );
+
+      if (!titleChanged) return { invalidation: null };
+
+      const invalidation =
+        await this.pageVerificationInvalidationService.invalidateForEdit(
+          {
+            pageId: page.id,
+            userId: user.id,
+            changedAt: null,
+            isMeaningfulChange: () => true,
+            loadPreviousState: async () => {
+              const { content } = await this.pageRepo.findById(page.id, {
+                includeContent: true,
+                trx,
+              });
+              return { ...current, content };
+            },
+          },
+          trx,
+        );
+      return { invalidation };
+    });
+
+    if (edit?.invalidation) {
+      await this.pageVerificationInvalidationService.notifyInvalidated(
+        edit.invalidation,
+        user.id,
+        'title',
+      );
+    }
+
+    if (edit || hasContentUpdate) {
+      this.scheduleCoverCleanup(page, coverFields);
+      this.generalQueue
+        .add(QueueJob.ADD_PAGE_WATCHERS, {
+          userIds: [user.id],
+          pageId: page.id,
+          spaceId: page.spaceId,
+          workspaceId: page.workspaceId,
+        })
+        .catch((err) =>
+          this.logger.warn(`Failed to queue add-page-watchers: ${err.message}`),
+        );
+    }
+
+    if (hasContentUpdate) {
+      await this.updatePageContent(page.id, content, operation, format, user);
     }
 
     return await this.pageRepo.findById(page.id, {
@@ -267,6 +358,94 @@ export class PageService {
       includeLastUpdatedBy: true,
       includeContributors: true,
     });
+  }
+
+  private async resolveCoverFields(
+    page: Page,
+    dto: UpdatePageDto,
+    user: User,
+  ): Promise<CoverFields> {
+    const fields: CoverFields = {};
+
+    if (dto.coverPhoto !== undefined && dto.coverPhoto !== page.coverPhoto) {
+      const cover = await this.resolveCover(page, dto.coverPhoto, user);
+      fields.coverPhoto = cover.coverPhoto;
+      if (cover.coverPhoto !== page.coverPhoto) {
+        fields.coverPosition = null;
+        fields.coverAttribution = cover.coverAttribution;
+      }
+    }
+
+    if (dto.coverPosition !== undefined) {
+      fields.coverPosition = dto.coverPosition;
+    }
+
+    const coverPhoto =
+      fields.coverPhoto !== undefined ? fields.coverPhoto : page.coverPhoto;
+    if (coverPhoto === null && fields.coverPosition !== undefined) {
+      fields.coverPosition = null;
+    }
+
+    return fields;
+  }
+
+  private async resolveCover(
+    page: Page,
+    coverPhoto: string | null,
+    user: User,
+  ): Promise<Pick<CoverFields, 'coverPhoto' | 'coverAttribution'>> {
+    if (coverPhoto === null || isPresetCover(coverPhoto)) {
+      return { coverPhoto, coverAttribution: null };
+    }
+
+    const unsplashPhotoId = getUnsplashPhotoId(coverPhoto);
+    if (unsplashPhotoId) {
+      return this.unsplashService.getCover(unsplashPhotoId, user.id);
+    }
+
+    return {
+      coverPhoto: await this.validateCoverFile(page, coverPhoto),
+      coverAttribution: null,
+    };
+  }
+
+  private async validateCoverFile(
+    page: Page,
+    coverPhoto: string,
+  ): Promise<string> {
+    const attachmentId = getCoverAttachmentId(coverPhoto);
+    const attachment = attachmentId
+      ? await this.attachmentRepo.findById(attachmentId)
+      : null;
+
+    // only cover uploads, so the cleanup job never touches a file the page shows elsewhere
+    if (
+      !attachment ||
+      attachment.type !== AttachmentType.PageCover ||
+      attachment.workspaceId !== page.workspaceId ||
+      attachment.pageId !== page.id ||
+      !COVER_IMAGE_MIME_TYPES.includes(attachment.mimeType)
+    ) {
+      throw new BadRequestException('Invalid cover photo');
+    }
+
+    return buildCoverFileUrl(attachment);
+  }
+
+  private scheduleCoverCleanup(page: Page, fields: CoverFields): void {
+    if (fields.coverPhoto === undefined) return;
+
+    const attachmentId = getCoverAttachmentId(page.coverPhoto);
+    if (!attachmentId || attachmentId === getCoverAttachmentId(fields.coverPhoto)) {
+      return;
+    }
+
+    queueCoverCleanup(this.attachmentQueue, {
+      pageId: page.id,
+      attachmentId,
+    }).catch((err) =>
+      this.logger.warn(`Failed to queue cover cleanup: ${err.message}`),
+    );
   }
 
   async updatePageContent(
@@ -300,11 +479,13 @@ export class PageService {
         'slugId',
         'title',
         'icon',
+        'coverPhoto',
         'position',
         'parentPageId',
         'spaceId',
         'creatorId',
         'isBase',
+        'updatedAt',
         'deletedAt',
       ])
       .select((eb) => this.pageRepo.withHasChildren(eb))
@@ -391,35 +572,51 @@ export class PageService {
   }
 
   async movePageToSpace(rootPage: Page, spaceId: string, userId: string) {
-    let childPageIds: string[] = [];
-
-    const allPages = await this.pageRepo.getPageAndDescendants(rootPage.id, {
-      includeContent: false,
-    });
-
-    // Filter to only accessible pages while maintaining tree integrity
-    const accessiblePages = await this.filterAccessibleTreePages(
-      allPages,
-      rootPage.id,
-      userId,
-      rootPage.spaceId,
-    );
-    const accessibleIds = new Set(accessiblePages.map((p) => p.id));
-
-    // Find inaccessible pages whose parent is being moved - these need to be orphaned
-    const pagesToOrphan = allPages.filter(
-      (p) =>
-        !accessibleIds.has(p.id) &&
-        p.parentPageId &&
-        accessibleIds.has(p.parentPageId),
+    const sharingAllowed = await this.shareService.isSharingAllowed(
+      rootPage.workspaceId,
+      spaceId,
     );
 
-    await executeTx(this.db, async (trx) => {
+    const result = await executeTx(this.db, async (trx) => {
+      await this.pageRepo.lockPageHierarchySpaces(
+        [rootPage.spaceId, spaceId],
+        trx,
+      );
+
+      const currentRootPage = await this.pageRepo.findById(rootPage.id, {
+        trx,
+      });
+      if (!currentRootPage || currentRootPage.deletedAt) {
+        throw new NotFoundException('Page to move not found');
+      }
+      if (currentRootPage.spaceId !== rootPage.spaceId) {
+        throw new ConflictException('Page location changed; retry the move');
+      }
+
+      const allPages = await this.pageRepo.getPageAndDescendants(
+        currentRootPage.id,
+        { includeContent: false, trx },
+      );
+      const accessiblePages = await this.filterAccessibleTreePages(
+        allPages,
+        currentRootPage.id,
+        userId,
+        currentRootPage.spaceId,
+      );
+      const accessibleIds = new Set(accessiblePages.map((p) => p.id));
+      const pagesToOrphan = allPages.filter(
+        (p) =>
+          !accessibleIds.has(p.id) &&
+          p.parentPageId &&
+          accessibleIds.has(p.parentPageId),
+      );
+
       // Orphan inaccessible child pages (make them root pages in original space)
       for (const page of pagesToOrphan) {
         const orphanPosition = await this.nextPagePosition(
-          rootPage.spaceId,
+          currentRootPage.spaceId,
           null,
+          trx,
         );
         await this.pageRepo.updatePage(
           { parentPageId: null, position: orphanPosition },
@@ -428,82 +625,163 @@ export class PageService {
         );
       }
 
+      const pageIdsToMove = accessiblePages.map((p) => p.id);
+
+      // trashed pages below the moved ones go along, keeping their parents and restrictions
+      const trashedPages =
+        pageIdsToMove.length > 0
+          ? await trx
+              .withRecursive('trashed_pages', (db) =>
+                db
+                  .selectFrom('pages')
+                  .select(['id'])
+                  .where('spaceId', '=', currentRootPage.spaceId)
+                  .where('deletedAt', 'is not', null)
+                  .where('parentPageId', 'in', pageIdsToMove)
+                  .unionAll((exp) =>
+                    exp
+                      .selectFrom('pages as p')
+                      .select(['p.id'])
+                      .innerJoin(
+                        'trashed_pages as tp',
+                        'tp.id',
+                        'p.parentPageId',
+                      )
+                      .where('p.spaceId', '=', currentRootPage.spaceId)
+                      .where('p.deletedAt', 'is not', null),
+                  ),
+              )
+              .selectFrom('trashed_pages')
+              .select('id')
+              .execute()
+          : [];
+      const trashedPageIds = trashedPages.map((p) => p.id);
+      const allPageIdsToMove = [...pageIdsToMove, ...trashedPageIds];
+
       // Update root page
-      const nextPosition = await this.nextPagePosition(spaceId);
+      const nextPosition = await this.nextPagePosition(spaceId, null, trx);
       await this.pageRepo.updatePage(
         { spaceId, parentPageId: null, position: nextPosition },
-        rootPage.id,
+        currentRootPage.id,
         trx,
       );
 
-      const pageIdsToMove = accessiblePages.map((p) => p.id);
-
-      childPageIds = pageIdsToMove.filter((id) => id !== rootPage.id);
+      const childPageIds = pageIdsToMove.filter(
+        (id) => id !== currentRootPage.id,
+      );
+      let deletedShares: Pick<Share, 'id' | 'pageId' | 'spaceId'>[] = [];
 
       if (pageIdsToMove.length > 1) {
         // Update sub pages (all accessible pages except root)
         await this.pageRepo.updatePages({ spaceId }, childPageIds, trx);
       }
 
+      if (trashedPageIds.length > 0) {
+        await trx
+          .updateTable('pages')
+          .set({ spaceId })
+          .where('id', 'in', trashedPageIds)
+          .execute();
+      }
+
       if (pageIdsToMove.length > 0) {
         await trx
           .updateTable('pageAccess')
           .set({ spaceId: spaceId })
-          .where('pageId', 'in', pageIdsToMove)
+          .where('pageId', 'in', allPageIdsToMove)
           .execute();
 
-        // update spaceId in shares
+        // shares only follow pages into spaces that allow public sharing
+        if (sharingAllowed) {
+          await trx
+            .updateTable('shares')
+            .set({ spaceId: spaceId })
+            .where('pageId', 'in', allPageIdsToMove)
+            .execute();
+        } else {
+          deletedShares = await trx
+            .deleteFrom('shares')
+            .where('pageId', 'in', allPageIdsToMove)
+            .returning(['id', 'pageId', 'spaceId'])
+            .execute();
+        }
+
         await trx
-          .updateTable('shares')
-          .set({ spaceId: spaceId })
-          .where('pageId', 'in', pageIdsToMove)
+          .updateTable('spaces')
+          .set({ homePageId: null })
+          .where('homePageId', 'in', allPageIdsToMove)
           .execute();
 
         // Update comments
         await trx
           .updateTable('comments')
           .set({ spaceId: spaceId })
-          .where('pageId', 'in', pageIdsToMove)
+          .where('pageId', 'in', allPageIdsToMove)
           .execute();
 
         // Update page verifications
         await trx
           .updateTable('pageVerifications')
           .set({ spaceId: spaceId })
-          .where('pageId', 'in', pageIdsToMove)
+          .where('pageId', 'in', allPageIdsToMove)
+          .execute();
+
+        // Update page history
+        await trx
+          .updateTable('pageHistory')
+          .set({ spaceId: spaceId })
+          .where('pageId', 'in', allPageIdsToMove)
           .execute();
 
         // Update notifications — access follows the page after a move
         await trx
           .updateTable('notifications')
           .set({ spaceId: spaceId })
-          .where('pageId', 'in', pageIdsToMove)
+          .where('pageId', 'in', allPageIdsToMove)
           .execute();
 
         // Update attachments
         await this.attachmentRepo.updateAttachmentsByPageId(
           { spaceId },
-          pageIdsToMove,
+          allPageIdsToMove,
           trx,
         );
 
         // Update watchers and remove those without access to new space
         await this.watcherService.movePageWatchersToSpace(
-          pageIdsToMove,
+          allPageIdsToMove,
           spaceId,
           {
             trx,
           },
         );
 
-        await this.aiQueue.add(QueueJob.PAGE_MOVED_TO_SPACE, {
-          pageIds: pageIdsToMove,
-          workspaceId: rootPage.workspaceId,
-        });
+        // trashed pages are embedded again when restored
+        await this.aiQueue.add(
+          QueueJob.PAGE_MOVED_TO_SPACE,
+          {
+            pageIds: pageIdsToMove,
+            spaceId,
+            workspaceId: currentRootPage.workspaceId,
+          },
+          {
+            attempts: 2,
+            backoff: {
+              type: 'fixed',
+              delay: 2 * 60 * 1000,
+            },
+          },
+        );
       }
+
+      return { childPageIds, deletedShares };
     });
 
-    return { childPageIds };
+    await this.collabAccessService.recheckAccess({ pageIds: [rootPage.id] });
+    await this.wsService.invalidateSpaceRestrictionCache(spaceId);
+    await this.wsService.removeBaseSubscribersWithoutAccess([rootPage.id]);
+
+    return result;
   }
 
   async duplicatePage(
@@ -551,7 +829,43 @@ export class PageService {
       slugIdMap.set(entry.oldSlugId, entry);
     }
 
-    const attachmentMap = new Map<string, ICopyPageAttachment>();
+    const restrictedAncestor = isDuplicateInSameSpace
+      ? undefined
+      : await this.pagePermissionRepo.findRestrictedAncestor(rootPage.id);
+    const restrictionCopies = pages.map((page) => ({
+      // a copy in another space leaves the original's parents behind, so its root takes their nearest restriction
+      sourcePageId:
+        page.id === rootPage.id && restrictedAncestor
+          ? restrictedAncestor.pageId
+          : page.id,
+      pageId: pageMap.get(page.id).newPageId,
+    }));
+
+    const copiedAttachmentIds = new Map<string, string>();
+
+    const pageAttachmentIds = new Map<string, string[]>();
+    const referencedAttachmentIds = new Set<string>();
+    for (const page of pages) {
+      const ids = getAttachmentIds(getProsemirrorContent(page.content));
+      pageAttachmentIds.set(page.id, ids);
+      ids.forEach((id) => referencedAttachmentIds.add(id));
+      const coverId = getCoverAttachmentId(page.coverPhoto);
+      if (coverId) referencedAttachmentIds.add(coverId);
+    }
+    const referencedAttachments =
+      referencedAttachmentIds.size > 0
+        ? await this.db
+            .selectFrom('attachments')
+            .selectAll()
+            .where('id', 'in', Array.from(referencedAttachmentIds))
+            .where('workspaceId', '=', rootPage.workspaceId)
+            .execute()
+        : [];
+    const ownedAttachmentIds = new Set(
+      referencedAttachments
+        .filter((attachment) => pageMap.has(attachment.pageId))
+        .map((attachment) => attachment.id),
+    );
 
     const insertablePages: InsertablePage[] = await Promise.all(
       pages.map(async (page) => {
@@ -561,44 +875,21 @@ export class PageService {
         const doc = jsonToNode(pageContent);
         const prosemirrorDoc = removeMarkTypeFromDoc(doc, 'comment');
 
-        const attachmentIds = getAttachmentIds(prosemirrorDoc.toJSON());
+        const attachmentIds = pageAttachmentIds.get(page.id);
 
-        if (attachmentIds.length > 0) {
-          attachmentIds.forEach((attachmentId: string) => {
-            const newPageId = pageFromMap.newPageId;
-            const newAttachmentId = uuid7();
-            attachmentMap.set(attachmentId, {
-              newPageId: newPageId,
-              oldPageId: page.id,
-              oldAttachmentId: attachmentId,
-              newAttachmentId: newAttachmentId,
-            });
-
-            prosemirrorDoc.descendants((node: PMNode) => {
-              if (isAttachmentNode(node.type.name)) {
-                if (node.attrs.attachmentId === attachmentId) {
-                  //@ts-ignore
-                  node.attrs.attachmentId = newAttachmentId;
-
-                  if (node.attrs.src) {
-                    //@ts-ignore
-                    node.attrs.src = node.attrs.src.replace(
-                      attachmentId,
-                      newAttachmentId,
-                    );
-                  }
-                  if (node.attrs.src) {
-                    //@ts-ignore
-                    node.attrs.src = node.attrs.src.replace(
-                      attachmentId,
-                      newAttachmentId,
-                    );
-                  }
-                }
-              }
-            });
+        attachmentIds
+          .filter((attachmentId: string) =>
+            ownedAttachmentIds.has(attachmentId),
+          )
+          .forEach((attachmentId: string) => {
+            // pages that show the same file share one copy of it
+            copiedAttachmentIds.set(
+              attachmentId,
+              copiedAttachmentIds.get(attachmentId) ?? uuid7(),
+            );
           });
-        }
+
+        const coverPhoto = remapCopiedCover(page.coverPhoto, copiedAttachmentIds, uuid7);
 
         // Update internal page links in mention nodes
         prosemirrorDoc.descendants((node: PMNode) => {
@@ -652,7 +943,10 @@ export class PageService {
           }
         });
 
-        const prosemirrorJson = prosemirrorDoc.toJSON();
+        const prosemirrorJson = replaceAttachmentIds(
+          prosemirrorDoc.toJSON(),
+          copiedAttachmentIds,
+        );
 
         // Add "Copy of " prefix to the root page title only for duplicates in same space
         let title = page.title;
@@ -666,6 +960,9 @@ export class PageService {
           slugId: pageFromMap.newSlugId,
           title: title,
           icon: page.icon,
+          coverPhoto,
+          coverPosition: page.coverPosition,
+          coverAttribution: page.coverAttribution,
           content: prosemirrorJson,
           textContent: jsonToText(prosemirrorJson),
           ydoc: createYdocFromJson(prosemirrorJson),
@@ -686,7 +983,26 @@ export class PageService {
       }),
     );
 
-    await this.db.insertInto('pages').values(insertablePages).execute();
+    const copiedRestrictions = await executeTx(this.db, async (trx) => {
+      await trx.insertInto('pages').values(insertablePages).execute();
+      await this.labelRepo.copyLabelsToPages(
+        new Map([...pageMap].map(([oldId, entry]) => [oldId, entry.newPageId])),
+        trx,
+      );
+      return this.pagePermissionRepo.copyRestrictions(
+        restrictionCopies,
+        {
+          spaceId,
+          workspaceId: rootPage.workspaceId,
+          writerId: authUser.id,
+        },
+        trx,
+      );
+    });
+
+    if (copiedRestrictions > 0) {
+      await this.wsService.invalidateSpaceRestrictionCache(spaceId);
+    }
 
     // Extract transclusions from every duplicated page and persist them in
     // one statement. Duplication bypasses Yjs onStoreDocument; brand-new
@@ -728,27 +1044,18 @@ export class PageService {
     });
 
     //TODO: best to handle this in a queue
-    const attachmentsIds = Array.from(attachmentMap.keys());
-    if (attachmentsIds.length > 0) {
-      const attachments = await this.db
-        .selectFrom('attachments')
-        .selectAll()
-        .where('id', 'in', attachmentsIds)
-        .where('workspaceId', '=', rootPage.workspaceId)
-        .execute();
-
-      for (const attachment of attachments) {
+    if (copiedAttachmentIds.size > 0) {
+      for (const attachment of referencedAttachments) {
         try {
-          const pageAttachment = attachmentMap.get(attachment.id);
-
-          // make sure the copied attachment belongs to the page it was copied from
-          if (attachment.pageId !== pageAttachment.oldPageId) {
+          // only files owned by a copied page are copied, and they go to that page's copy
+          const owner = pageMap.get(attachment.pageId);
+          if (!owner) {
             continue;
           }
 
-          const newAttachmentId = pageAttachment.newAttachmentId;
+          const newAttachmentId = copiedAttachmentIds.get(attachment.id);
 
-          const newPageId = pageAttachment.newPageId;
+          const newPageId = owner.newPageId;
 
           const newPathFile = attachment.filePath.replace(
             attachment.id,
@@ -768,7 +1075,7 @@ export class PageService {
                 fileSize: attachment.fileSize,
                 mimeType: attachment.mimeType,
                 fileExt: attachment.fileExt,
-                creatorId: attachment.creatorId,
+                creatorId: authUser.id,
                 workspaceId: attachment.workspaceId,
                 pageId: newPageId,
                 spaceId: spaceId,
@@ -810,31 +1117,77 @@ export class PageService {
       throw new BadRequestException('Invalid move position');
     }
 
-    let parentPageId = null;
-    if (movedPage.parentPageId === dto.parentPageId) {
-      parentPageId = undefined;
-    } else {
-      // changing the page's parent
-      if (dto.parentPageId) {
-        const parentPage = await this.pageRepo.findById(dto.parentPageId);
-        if (
-          !parentPage ||
-          parentPage.deletedAt ||
-          parentPage.spaceId !== movedPage.spaceId
-        ) {
-          throw new NotFoundException('Parent page not found');
-        }
-        parentPageId = parentPage.id;
-      }
+    if (dto.parentPageId && dto.parentPageId === dto.pageId) {
+      throw new BadRequestException('A page cannot be its own parent');
     }
 
-    await this.pageRepo.updatePage(
-      {
-        position: dto.position,
-        parentPageId: parentPageId,
-      },
-      dto.pageId,
-    );
+    const mayLoseAccess = await executeTx(this.db, async (trx) => {
+      await this.pageRepo.lockPageHierarchySpaces(
+        [movedPage.spaceId],
+        trx,
+      );
+
+      const currentPage = await this.pageRepo.findById(movedPage.id, { trx });
+      if (!currentPage || currentPage.deletedAt) {
+        throw new NotFoundException('Moved page not found');
+      }
+      if (currentPage.spaceId !== movedPage.spaceId) {
+        throw new ConflictException('Page location changed; retry the move');
+      }
+
+      let parentPageId = null;
+      if (currentPage.parentPageId === dto.parentPageId) {
+        parentPageId = undefined;
+      } else {
+        if (dto.parentPageId) {
+          const parentPage = await this.pageRepo.findById(dto.parentPageId, {
+            trx,
+          });
+          if (
+            !parentPage ||
+            parentPage.deletedAt ||
+            parentPage.spaceId !== currentPage.spaceId
+          ) {
+            throw new NotFoundException('Parent page not found');
+          }
+          if (
+            await this.pageRepo.isPageDescendant(
+              movedPage.id,
+              parentPage.id,
+              trx,
+            )
+          ) {
+            throw new BadRequestException(
+              'A page cannot be moved under its descendant',
+            );
+          }
+          parentPageId = parentPage.id;
+        }
+      }
+
+      await this.pageRepo.updatePage(
+        {
+          position: dto.position,
+          parentPageId: parentPageId,
+        },
+        movedPage.id,
+        trx,
+      );
+
+      // a new parent only changes access in a space with restricted pages
+      return (
+        parentPageId !== undefined &&
+        (await this.pagePermissionRepo.hasRestrictedPagesInSpace(
+          currentPage.spaceId,
+          { trx },
+        ))
+      );
+    });
+
+    if (mayLoseAccess) {
+      await this.collabAccessService.recheckAccess({ pageIds: [movedPage.id] });
+      await this.wsService.removeBaseSubscribersWithoutAccess([movedPage.id]);
+    }
   }
 
   async getPageBreadCrumbs(childPageId: string) {
@@ -870,7 +1223,8 @@ export class PageService {
                 'p.deletedAt',
               ])
               .innerJoin('page_ancestors as pa', 'pa.parentPageId', 'p.id')
-              .where('p.deletedAt', 'is', null),
+              .where('p.deletedAt', 'is', null)
+              .whereRef('p.spaceId', '=', 'pa.spaceId'),
           ),
       )
       .selectFrom('page_ancestors')
@@ -1044,20 +1398,22 @@ export class PageService {
     await this.pageRepo.removePage(pageId, userId, workspaceId);
   }
 
-  private async parseProsemirrorContent(
+  async parseProsemirrorContent(
     content: string | object,
     format: ContentFormat,
+    context: 'page' | 'template' = 'page',
   ): Promise<any> {
+    const extensions = context === 'template' ? templateExtensions : tiptapExtensions;
     let prosemirrorJson: any;
 
     switch (format) {
       case 'markdown': {
         const html = await markdownToHtml(content as string);
-        prosemirrorJson = htmlToJson(html as string);
+        prosemirrorJson = htmlToJson(html as string, extensions);
         break;
       }
       case 'html': {
-        prosemirrorJson = htmlToJson(content as string);
+        prosemirrorJson = htmlToJson(content as string, extensions);
         break;
       }
       case 'json':
@@ -1068,12 +1424,10 @@ export class PageService {
     }
 
     try {
-      jsonToNode(prosemirrorJson);
+      return parseDocumentJson(prosemirrorJson, extensions).content;
     } catch (err) {
       throw new BadRequestException('Invalid content format');
     }
-
-    return prosemirrorJson;
   }
 
   /**

@@ -6,15 +6,27 @@ import { isCloud } from "@/lib/config.ts";
 import { SearchSpotlight } from "@/features/search/components/search-spotlight.tsx";
 import React from "react";
 import { useGetSpaceBySlugQuery } from "@/features/space/queries/space-query.ts";
+import { AppErrorBoundary } from "@/components/ui/app-error-boundary.tsx";
+import { PageLoading } from "@/pages/page/page-loading";
 
 export default function Layout() {
-  const { spaceSlug } = useParams();
+  const { spaceSlug, pageSlug } = useParams();
   const { data: space } = useGetSpaceBySlugQuery(spaceSlug);
 
   return (
-    <UserProvider>
+    <UserProvider
+      pending={
+        <GlobalAppShell sessionPending>
+          {pageSlug && <PageLoading />}
+        </GlobalAppShell>
+      }
+    >
       <GlobalAppShell>
-        <Outlet />
+        <AppErrorBoundary>
+          <React.Suspense fallback={null}>
+            <Outlet />
+          </React.Suspense>
+        </AppErrorBoundary>
       </GlobalAppShell>
       {isCloud() && <PosthogUser />}
       <SearchSpotlight spaceId={space?.id} />

@@ -40,6 +40,9 @@ export class StaticModule implements OnModuleInit {
         FILE_IMPORT_SIZE_LIMIT:
           this.environmentService.getFileImportSizeLimit(),
         DRAWIO_URL: this.environmentService.getDrawioUrl(),
+        UNSPLASH_ENABLED: Boolean(
+          this.environmentService.getUnsplashAccessKey(),
+        ),
         SUBDOMAIN_HOST: this.environmentService.isCloud()
           ? this.environmentService.getSubdomainHost()
           : undefined,
@@ -47,8 +50,14 @@ export class StaticModule implements OnModuleInit {
         BILLING_TRIAL_DAYS: this.environmentService.isCloud()
           ? this.environmentService.getBillingTrialDays()
           : undefined,
+        BETA_PUBLIC_SPACES: this.environmentService.isBetaPublicSpaces(),
+        BETA_BASE_FORMS: this.environmentService.isBetaBaseForms(),
         POSTHOG_HOST: this.environmentService.getPostHogHost(),
         POSTHOG_KEY: this.environmentService.getPostHogKey(),
+        AI_VECTOR_DRIVER:
+          this.environmentService.getAiVectorDriver() === 'turbopuffer'
+            ? 'turbopuffer'
+            : undefined,
       };
 
       const windowScriptContent = `<script>window.CONFIG=${JSON.stringify(configString)};</script>`;
@@ -67,9 +76,23 @@ export class StaticModule implements OnModuleInit {
       await app.register(fastifyStatic, {
         root: clientDistPath,
         wildcard: false,
+        setHeaders: (reply: any, pathName: string) => {
+          // Vite content-hashes everything under /assets, so they can be cached forever
+          if (/[\\/]assets[\\/]/.test(pathName)) {
+            reply.header(
+              'Cache-Control',
+              'public, max-age=31536000, immutable',
+            );
+          }
+        },
       });
 
       app.get(RENDER_PATH, (req: any, res: any) => {
+        // a missing hashed asset belongs to another build, so don't answer it with the app shell
+        if (req.url.startsWith('/assets/')) {
+          return res.code(404).header('Cache-Control', 'no-store').send();
+        }
+
         const stream = fs.createReadStream(indexFilePath);
         res
           .header('Cache-Control', 'no-cache, no-store, must-revalidate')

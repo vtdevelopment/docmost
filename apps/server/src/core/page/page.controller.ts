@@ -26,6 +26,7 @@ import { PageHistoryService } from './services/page-history.service';
 import { AuthUser } from '../../common/decorators/auth-user.decorator';
 import { AuthWorkspace } from '../../common/decorators/auth-workspace.decorator';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
+import { OAuthScope } from '../../common/decorators/oauth-scope.decorator';
 import { PaginationOptions } from '@docmost/db/pagination/pagination-options';
 import { Page, User, Workspace } from '@docmost/db/types/entity.types';
 import { SidebarPageDto } from './dto/sidebar-page.dto';
@@ -35,6 +36,7 @@ import {
 } from '../casl/interfaces/space-ability.type';
 import SpaceAbilityFactory from '../casl/abilities/space-ability.factory';
 import { PageRepo } from '@docmost/db/repos/page/page.repo';
+import { RecentlyUpdatedDto } from './dto/recently-updated.dto';
 import { RecentPageDto } from './dto/recent-page.dto';
 import { CreatedByUserDto } from './dto/created-by-user.dto';
 import { DuplicatePageDto } from './dto/duplicate-page.dto';
@@ -52,6 +54,7 @@ import {
   IAuditService,
 } from '../../integrations/audit/audit.service';
 import { getPageTitle } from '../../common/helpers';
+import { ApiKeyScope } from '../../common/decorators/api-key-scope.decorator';
 
 @UseGuards(JwtAuthGuard)
 @Controller('pages')
@@ -69,6 +72,7 @@ export class PageController {
 
   @HttpCode(HttpStatus.OK)
   @Post('/info')
+  @OAuthScope('read')
   async getPage(@Body() dto: PageInfoDto, @AuthUser() user: User) {
     const page = await this.pageRepo.findById(dto.pageId, {
       includeSpace: true,
@@ -103,6 +107,7 @@ export class PageController {
     return { ...page, permissions };
   }
 
+  @ApiKeyScope('read')
   @HttpCode(HttpStatus.OK)
   @Post('labels')
   async getPageLabels(
@@ -161,6 +166,7 @@ export class PageController {
     );
   }
 
+  @ApiKeyScope('read')
   @HttpCode(HttpStatus.OK)
   @Post('backlinks-count')
   async getBacklinksCount(
@@ -176,6 +182,7 @@ export class PageController {
     return this.backlinkService.countByPageId(page.id, user.id);
   }
 
+  @ApiKeyScope('read')
   @HttpCode(HttpStatus.OK)
   @Post('backlinks')
   async getBacklinks(
@@ -199,6 +206,7 @@ export class PageController {
 
   @HttpCode(HttpStatus.OK)
   @Post('create')
+  @OAuthScope('write')
   async create(
     @Body() createPageDto: CreatePageDto,
     @AuthUser() user: User,
@@ -269,6 +277,7 @@ export class PageController {
 
   @HttpCode(HttpStatus.OK)
   @Post('update')
+  @OAuthScope('write')
   async update(@Body() updatePageDto: UpdatePageDto, @AuthUser() user: User) {
     const page = await this.pageRepo.findById(updatePageDto.pageId);
 
@@ -411,8 +420,17 @@ export class PageController {
     });
   }
 
+  @ApiKeyScope('read')
+  @OAuthScope('read')
+  @HttpCode(HttpStatus.OK)
+  @Post('recently-updated')
+  async getRecentlyUpdatedPages(@Body() options: RecentlyUpdatedDto, @AuthUser() user: User) {
+    return this.pageRepo.getRecentlyUpdatedPages(user.id, user.workspaceId, options);
+  }
+
   @HttpCode(HttpStatus.OK)
   @Post('recent')
+  @OAuthScope('read')
   async getRecentPages(
     @Body() recentPageDto: RecentPageDto,
     @Body() pagination: PaginationOptions,
@@ -438,6 +456,7 @@ export class PageController {
     return this.pageService.getRecentPages(user.id, pagination);
   }
 
+  @ApiKeyScope('read')
   @HttpCode(HttpStatus.OK)
   @Post('created-by-user')
   async getCreatedByPages(
@@ -461,6 +480,7 @@ export class PageController {
     return this.pageService.getCreatedByPages(targetUserId, user.id, pagination, dto.spaceId);
   }
 
+  @ApiKeyScope('read')
   @HttpCode(HttpStatus.OK)
   @Post('trash')
   async getDeletedPages(
@@ -486,6 +506,7 @@ export class PageController {
     }
   }
 
+  @ApiKeyScope('read')
   @HttpCode(HttpStatus.OK)
   @Post('/history')
   async getPageHistory(
@@ -503,6 +524,7 @@ export class PageController {
     return this.pageHistoryService.findHistoryByPageId(page.id, pagination);
   }
 
+  @ApiKeyScope('read')
   @HttpCode(HttpStatus.OK)
   @Post('/history/info')
   async getPageHistoryInfo(
@@ -527,6 +549,7 @@ export class PageController {
 
   @HttpCode(HttpStatus.OK)
   @Post('/sidebar-pages')
+  @OAuthScope('read')
   async getSidebarPages(
     @Body() dto: SidebarPageDto,
     @Body() pagination: PaginationOptions,
@@ -538,6 +561,7 @@ export class PageController {
       );
     }
     let spaceId = dto.spaceId;
+    let pageId: string;
 
     if (dto.pageId) {
       const page = await this.pageRepo.findById(dto.pageId);
@@ -546,6 +570,7 @@ export class PageController {
       }
 
       spaceId = page.spaceId;
+      pageId = page.id;
     }
 
     const ability = await this.spaceAbility.createForUser(user, spaceId);
@@ -561,7 +586,7 @@ export class PageController {
     return this.pageService.getSidebarPages(
       spaceId,
       pagination,
-      dto.pageId,
+      pageId,
       user.id,
       spaceCanEdit,
     );
@@ -569,6 +594,7 @@ export class PageController {
 
   @HttpCode(HttpStatus.OK)
   @Post('move-to-space')
+  @OAuthScope('write')
   async movePageToSpace(
     @Body() dto: MovePageToSpaceDto,
     @AuthUser() user: User,
@@ -598,11 +624,8 @@ export class PageController {
     await this.pageAccessService.validateCanEdit(movedPage, user);
 
     // Moves only accessible pages; inaccessible child pages become root pages in original space
-    const { childPageIds } = await this.pageService.movePageToSpace(
-      movedPage,
-      dto.spaceId,
-      user.id,
-    );
+    const { childPageIds, deletedShares } =
+      await this.pageService.movePageToSpace(movedPage, dto.spaceId, user.id);
 
     this.auditService.log({
       event: AuditEvent.PAGE_MOVED_TO_SPACE,
@@ -618,10 +641,26 @@ export class PageController {
         ...(childPageIds.length > 0 && { childPageIds }),
       },
     });
+
+    for (const share of deletedShares) {
+      this.auditService.log({
+        event: AuditEvent.SHARE_DELETED,
+        resourceType: AuditResource.SHARE,
+        resourceId: share.id,
+        spaceId: share.spaceId,
+        changes: {
+          before: {
+            pageId: share.pageId,
+            spaceId: share.spaceId,
+          },
+        },
+      });
+    }
   }
 
   @HttpCode(HttpStatus.OK)
   @Post('duplicate')
+  @OAuthScope('write')
   async duplicatePage(@Body() dto: DuplicatePageDto, @AuthUser() user: User) {
     const copiedPage = await this.pageRepo.findById(dto.pageId);
     if (!copiedPage) {
@@ -706,6 +745,7 @@ export class PageController {
 
   @HttpCode(HttpStatus.OK)
   @Post('move')
+  @OAuthScope('write')
   async movePage(@Body() dto: MovePageDto, @AuthUser() user: User) {
     const movedPage = await this.pageRepo.findById(dto.pageId);
     if (!movedPage) {
@@ -736,6 +776,7 @@ export class PageController {
     return this.pageService.movePage(dto, movedPage);
   }
 
+  @ApiKeyScope('read')
   @HttpCode(HttpStatus.OK)
   @Post('/breadcrumbs')
   async getPageBreadcrumbs(@Body() dto: PageIdDto, @AuthUser() user: User) {

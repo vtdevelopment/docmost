@@ -1,4 +1,12 @@
-import { Global, Logger, Module, OnApplicationBootstrap } from '@nestjs/common';
+import {
+  DynamicModule,
+  Global,
+  Inject,
+  Logger,
+  Module,
+  OnApplicationBootstrap,
+  Optional,
+} from '@nestjs/common';
 import { InjectKysely, KyselyModule } from 'nestjs-kysely';
 import { EnvironmentService } from '../integrations/environment/environment.service';
 import { CamelCasePlugin, LogEvent, sql } from 'kysely';
@@ -22,6 +30,7 @@ import { UserTokenRepo } from './repos/user-token/user-token.repo';
 import { UserSessionRepo } from '@docmost/db/repos/session/user-session.repo';
 import { BacklinkRepo } from '@docmost/db/repos/backlink/backlink.repo';
 import { ShareRepo } from '@docmost/db/repos/share/share.repo';
+import { PublicSpaceRepo } from '@docmost/db/repos/public-space/public-space.repo';
 import { NotificationRepo } from '@docmost/db/repos/notification/notification.repo';
 import { WatcherRepo } from '@docmost/db/repos/watcher/watcher.repo';
 import { LabelRepo } from '@docmost/db/repos/label/label.repo';
@@ -33,6 +42,8 @@ import { PageListener } from '@docmost/db/listeners/page.listener';
 import { PostgresJSDialect } from 'kysely-postgres-js';
 import * as postgres from 'postgres';
 import { normalizePostgresUrl } from '../common/helpers';
+import { DATABASE_MODULE_OPTIONS } from './database.constants';
+import { DatabaseModuleOptions } from './database.types';
 
 @Global()
 @Module({
@@ -90,6 +101,7 @@ import { normalizePostgresUrl } from '../common/helpers';
     UserSessionRepo,
     BacklinkRepo,
     ShareRepo,
+    PublicSpaceRepo,
     NotificationRepo,
     WatcherRepo,
     LabelRepo,
@@ -117,6 +129,7 @@ import { normalizePostgresUrl } from '../common/helpers';
     UserSessionRepo,
     BacklinkRepo,
     ShareRepo,
+    PublicSpaceRepo,
     NotificationRepo,
     WatcherRepo,
     LabelRepo,
@@ -132,12 +145,24 @@ export class DatabaseModule implements OnApplicationBootstrap {
     @InjectKysely() private readonly db: KyselyDB,
     private readonly migrationService: MigrationService,
     private readonly environmentService: EnvironmentService,
+    @Optional() @Inject(DATABASE_MODULE_OPTIONS)
+    private readonly options?: DatabaseModuleOptions,
   ) {}
+
+  static forRoot(options: DatabaseModuleOptions): DynamicModule {
+    return {
+      module: DatabaseModule,
+      providers: [{ provide: DATABASE_MODULE_OPTIONS, useValue: options }],
+    };
+  }
 
   async onApplicationBootstrap() {
     await this.establishConnection();
 
-    if (this.environmentService.getNodeEnv() === 'production') {
+    if (
+      this.environmentService.getNodeEnv() === 'production' &&
+      this.options?.runMigrations !== false
+    ) {
       await this.migrationService.migrateToLatest();
     }
   }

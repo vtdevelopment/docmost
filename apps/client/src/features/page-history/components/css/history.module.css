@@ -1,7 +1,7 @@
 .history {
-  display: block;
+  display: flex;
+  align-items: center;
   width: 100%;
-  padding: var(--mantine-spacing-md);
   color: light-dark(var(--mantine-color-black), var(--mantine-color-dark-0));
 
   @mixin hover {
@@ -10,6 +10,28 @@
       var(--mantine-color-dark-8)
     );
   }
+}
+
+.historyButton {
+  flex: 1;
+  min-width: 0;
+  color: inherit;
+}
+
+.compareCheckbox {
+  padding-left: var(--mantine-spacing-xs);
+}
+
+.itemMenu {
+  opacity: 0;
+  margin-right: var(--mantine-spacing-xs);
+}
+
+.history:hover .itemMenu,
+.history:focus-within .itemMenu,
+.history.active .itemMenu,
+.itemMenu[aria-expanded="true"] {
+  opacity: 1;
 }
 
 .historyEditor {
@@ -46,6 +68,49 @@
     outline-offset: rem(4px);
     border-radius: rem(4px);
   }
+
+  /* a removed item must not renumber the items that are still there */
+  & :global(ol > li.history-diff-block-deleted) {
+    counter-increment: list-item 0;
+    list-style-type: none;
+  }
+
+  & :global(.history-diff-formatted) {
+    border-bottom: rem(2px) dotted
+      light-dark(var(--mantine-color-blue-5), var(--mantine-color-blue-7));
+    cursor: help;
+    -webkit-box-decoration-break: clone;
+    box-decoration-break: clone;
+  }
+
+  & :global(.history-diff-node-formatted) {
+    position: relative;
+    outline: rem(1px) solid
+      light-dark(var(--mantine-color-blue-2), var(--mantine-color-blue-9));
+    outline-offset: rem(2px);
+    border-radius: rem(4px);
+  }
+
+  & :global(.history-diff-node-formatted)::after {
+    content: attr(data-diff-label);
+    position: absolute;
+    top: rem(-3px);
+    right: rem(8px);
+    transform: translateY(-50%);
+    padding: 0 rem(6px);
+    border-radius: rem(4px);
+    font-size: var(--mantine-font-size-xs);
+    font-weight: 400;
+    font-style: normal;
+    line-height: 1.5;
+    white-space: nowrap;
+    color: light-dark(var(--mantine-color-blue-9), var(--mantine-color-blue-0));
+    background: light-dark(
+      var(--mantine-color-blue-0),
+      var(--mantine-color-blue-9)
+    );
+    pointer-events: none;
+  }
 }
 
 .active {
@@ -67,13 +132,23 @@
 
 .sidebarFlex {
   display: flex;
+  /* the window height minus the modal's offsets, header and bottom padding */
+  max-height: calc(100dvh - var(--modal-y-offset) * 2 - rem(76px));
 }
 
 .sidebarMain {
   flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 
 .sidebarRightSection {
   flex: 1;
   padding: rem(16px) rem(40px);
+}
+
+.compareBanner {
+  border-bottom: rem(1px) solid
+    light-dark(var(--mantine-color-gray-3), var(--mantine-color-dark-4));
 }

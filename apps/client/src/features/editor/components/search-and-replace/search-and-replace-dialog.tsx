@@ -4,6 +4,7 @@ import {
   Dialog,
   Flex,
   Input,
+  rem,
   Stack,
   Text,
   Tooltip,
@@ -66,7 +67,7 @@ function SearchAndReplaceDialog({ editor, editable = true }: PageFindDialogDialo
     }
     // Clear search term in editor
     if (isEditorReady(editor)) {
-      editor.commands.setSearchTerm("");
+      editor.commands.setSearchTerms([""]);
     }
   };
 
@@ -79,6 +80,7 @@ function SearchAndReplaceDialog({ editor, editable = true }: PageFindDialogDialo
     const position: Range = results[resultIndex];
 
     if (!position) return;
+    editor.commands.showTabAt(results[resultIndex].from);
 
     // @ts-ignore
     editor.commands.setTextSelection(position);
@@ -117,7 +119,7 @@ function SearchAndReplaceDialog({ editor, editable = true }: PageFindDialogDialo
 
   useEffect(() => {
     if (!isEditorReady(editor)) return;
-    editor.commands.setSearchTerm(searchText);
+    editor.commands.setSearchTerms([searchText]);
     editor.commands.resetIndex();
     editor.commands.selectCurrentItem();
   }, [searchText]);
@@ -181,8 +183,10 @@ function SearchAndReplaceDialog({ editor, editable = true }: PageFindDialogDialo
 
   const location = useLocation();
   useEffect(() => {
-    closeDialog();
-  }, [location]);
+    if (pageFindState.isOpen) {
+      closeDialog();
+    }
+  }, [location.pathname]);
 
   return (
     <Dialog
@@ -192,7 +196,10 @@ function SearchAndReplaceDialog({ editor, editable = true }: PageFindDialogDialo
       size="lg"
       radius="md"
       w={"auto"}
-      position={{ top: 90, right: 50 }}
+      position={{
+        top: `calc(${rem(90)} + var(--announcement-banners-height, 0px))`,
+        right: 50,
+      }}
       withBorder
       transitionProps={{ transition: "slide-down" }}
       aria-label={t("Find and replace")}

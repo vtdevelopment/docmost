@@ -10,10 +10,14 @@ import {
 import { Server, Socket } from 'socket.io';
 import { TokenService } from '../core/auth/services/token.service';
 import { JwtPayload, JwtType } from '../core/auth/dto/jwt-payload';
-import { OnModuleDestroy } from '@nestjs/common';
-import { SpaceMemberRepo } from '@docmost/db/repos/space/space-member.repo';
+import { OnModuleDestroy, UnauthorizedException } from '@nestjs/common';
+import { JsonWebTokenError } from '@nestjs/jwt';
 import { WsService } from './ws.service';
-import { getSpaceRoomName, getUserRoomName } from './ws.utils';
+import {
+  getSessionRoomName,
+  getSpaceRoomName,
+  getUserRoomName,
+} from './ws.utils';
 import { BaseRealtimeBridge } from './base-realtime.bridge';
 import * as cookie from 'cookie';
 
@@ -33,7 +37,6 @@ export class WsGateway
 
   constructor(
     private tokenService: TokenService,
-    private spaceMemberRepo: SpaceMemberRepo,
     private wsService: WsService,
     private baseRealtime: BaseRealtimeBridge,
   ) {}
@@ -44,8 +47,10 @@ export class WsGateway
   }
 
   async handleConnection(client: Socket, ...args: any[]): Promise<void> {
+    let settle: () => void = () => undefined;
+    client.data.ready = new Promise<void>((resolve) => (settle = resolve));
     try {
-      const cookies = cookie.parse(client.handshake.headers.cookie);
+      const cookies = cookie.parse(client.handshake.headers.cookie ?? '');
       const token: JwtPayload = await this.tokenService.verifyJwt(
         cookies['authToken'],
         JwtType.ACCESS,
@@ -54,19 +59,32 @@ export class WsGateway
       const userId = token.sub;
       const workspaceId = token.workspaceId;
 
+      const userSpaceIds = await this.wsService.authorizeConnection(token);
+
       client.data.userId = userId;
       client.data.workspaceId = workspaceId;
-
-      const userSpaceIds = await this.spaceMemberRepo.getUserSpaceIds(userId);
 
       const userRoom = getUserRoomName(userId);
       const workspaceRoom = `workspace-${workspaceId}`;
       const spaceRooms = userSpaceIds.map((id) => getSpaceRoomName(id));
+      const sessionRooms = token.sessionId
+        ? [getSessionRoomName(token.sessionId)]
+        : [];
 
-      client.join([userRoom, workspaceRoom, ...spaceRooms]);
+      client.join([userRoom, workspaceRoom, ...spaceRooms, ...sessionRooms]);
     } catch (err) {
-      client.emit('Unauthorized');
-      client.disconnect();
+      if (
+        err instanceof UnauthorizedException ||
+        err instanceof JsonWebTokenError
+      ) {
+        client.emit('Unauthorized');
+        client.disconnect();
+        return;
+      }
+      // not an auth failure, closing the transport lets the client reconnect
+      client.conn.close();
+    } finally {
+      settle();
     }
   }
 
@@ -76,6 +94,7 @@ export class WsGateway
 
   @SubscribeMessage('message')
   async handleMessage(client: Socket, data: any): Promise<void> {
+    await client.data.ready;
     if (this.wsService.isTreeEvent(data)) {
       await this.wsService.handleTreeEvent(client, data);
       return;

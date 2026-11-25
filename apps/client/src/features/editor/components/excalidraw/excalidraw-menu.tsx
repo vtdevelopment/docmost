@@ -1,6 +1,7 @@
-import { BubbleMenu as BaseBubbleMenu } from "@tiptap/react/menus";
+import { NodeBubbleMenu } from "@/features/editor/components/bubble-menu/node-bubble-menu";
 import { findParentNode, posToDOMRect, useEditorState } from "@tiptap/react";
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
+import { useSetAtom } from "jotai";
 import { Node as PMNode } from "@tiptap/pm/model";
 import { isEditorReady } from "@docmost/editor-ext";
 import {
@@ -25,10 +26,12 @@ import {
   IconDownload,
   IconEdit,
   IconTrash,
+  IconZoomIn,
 } from "@tabler/icons-react";
 import { useTranslation } from "react-i18next";
 import { getFileUrl } from "@/lib/config.ts";
 import { uploadFile } from "@/features/page/services/page-service.ts";
+import { getEditorUploadTarget } from "@/features/editor/utils/upload-target";
 import { svgStringToFile } from "@/lib";
 import "@excalidraw/excalidraw/index.css";
 import type { ExcalidrawImperativeAPI } from "@excalidraw/excalidraw/types";
@@ -37,6 +40,13 @@ import ReactClearModal from "react-clear-modal";
 import { useHandleLibrary } from "@excalidraw/excalidraw";
 import { localStorageLibraryAdapter } from "@/features/editor/components/excalidraw/excalidraw-utils.ts";
 import { useAltTextControl } from "@/features/editor/components/common/use-alt-text-control.tsx";
+import { notifyDiagramSaveError } from "@/features/editor/components/common/diagram-save-error";
+import { lightboxRequestAtom } from "@/features/editor/atoms/editor-atoms";
+import {
+  diagramSizeAt,
+  diagramZoom,
+  drawingSize,
+} from "@/features/editor/components/common/diagram-size";
 import classes from "../common/toolbar-menu.module.css";
 
 const ExcalidrawComponent = lazy(() =>
@@ -47,6 +57,7 @@ const ExcalidrawComponent = lazy(() =>
 
 export function ExcalidrawMenu({ editor }: EditorMenuProps) {
   const { t } = useTranslation();
+  const setLightboxRequest = useSetAtom(lightboxRequestAtom);
   const [opened, { open, close }] = useDisclosure(false);
   const [excalidrawAPI, setExcalidrawAPI] =
     useState<ExcalidrawImperativeAPI>(null);
@@ -58,6 +69,7 @@ export function ExcalidrawMenu({ editor }: EditorMenuProps) {
   const computedColorScheme = useComputedColorScheme();
   const isDirtyRef = useRef(false);
   const isSavingRef = useRef(false);
+  const zoomRef = useRef<number | null>(null);
   const [isSaving, setIsSaving] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const isInitialLoadRef = useRef(true);
@@ -169,6 +181,7 @@ export function ExcalidrawMenu({ editor }: EditorMenuProps) {
     if (!editorState?.src) return;
 
     setIsLoading(true);
+    zoomRef.current = null;
     try {
       const url = getFileUrl(editorState.src);
       const request = await fetch(url, {
@@ -176,8 +189,14 @@ export function ExcalidrawMenu({ editor }: EditorMenuProps) {
         cache: "no-store",
       });
 
+      const blob = await request.blob();
+      zoomRef.current = diagramZoom(
+        editor.getAttributes("excalidraw").width,
+        drawingSize(await blob.text()),
+      );
+
       const { loadFromBlob } = await import("@excalidraw/excalidraw");
-      const data = await loadFromBlob(await request.blob(), null, null);
+      const data = await loadFromBlob(blob, null, null);
       setExcalidrawData(data);
     } catch (err) {
       console.error(err);
@@ -187,7 +206,7 @@ export function ExcalidrawMenu({ editor }: EditorMenuProps) {
       isInitialLoadRef.current = true;
       open();
     }
-  }, [editorState?.src, open]);
+  }, [editor, editorState?.src, open]);
 
   const saveData = useCallback(async () => {
     if (!excalidrawAPI || isSavingRef.current) {
@@ -198,15 +217,18 @@ export function ExcalidrawMenu({ editor }: EditorMenuProps) {
     setIsSaving(true);
 
     try {
-      const { exportToSvg } = await import("@excalidraw/excalidraw");
+      const { exportScene } = await import("@excalidraw/excalidraw");
 
-      const svg = await exportToSvg({
-        elements: excalidrawAPI?.getSceneElements(),
-        appState: {
-          exportEmbedScene: true,
-          exportWithDarkMode: false,
+      const svg = await exportScene({
+        type: "svg",
+        data: {
+          elements: excalidrawAPI?.getSceneElements(),
+          files: excalidrawAPI?.getFiles(),
         },
-        files: excalidrawAPI?.getFiles(),
+        config: {
+          embedScene: true,
+          theme: "light",
+        },
       });
 
       const serializer = new XMLSerializer();
@@ -220,15 +242,15 @@ export function ExcalidrawMenu({ editor }: EditorMenuProps) {
       const fileName = "diagram.excalidraw.svg";
       const excalidrawSvgFile = await svgStringToFile(svgString, fileName);
 
-      // @ts-ignore
-      const pageId = editor.storage?.pageId;
+      const uploadTarget = getEditorUploadTarget(editor);
+      if (!uploadTarget) return;
       const attachmentId = editorState?.attachmentId;
 
       let attachment: IAttachment = null;
       if (attachmentId) {
-        attachment = await uploadFile(excalidrawSvgFile, pageId, attachmentId);
+        attachment = await uploadFile(excalidrawSvgFile, uploadTarget, attachmentId);
       } else {
-        attachment = await uploadFile(excalidrawSvgFile, pageId);
+        attachment = await uploadFile(excalidrawSvgFile, uploadTarget);
       }
 
       editor.commands.updateAttributes("excalidraw", {
@@ -236,6 +258,7 @@ export function ExcalidrawMenu({ editor }: EditorMenuProps) {
         title: attachment.fileName,
         size: attachment.fileSize,
         attachmentId: attachment.id,
+        ...diagramSizeAt(zoomRef.current, drawingSize(svgString)),
       });
 
       isDirtyRef.current = false;
@@ -249,8 +272,9 @@ export function ExcalidrawMenu({ editor }: EditorMenuProps) {
     try {
       await saveData();
       close();
-    } catch {
+    } catch (err) {
       // save failed, modal stays open
+      notifyDiagramSaveError(err);
     }
   }, [saveData, close]);
 
@@ -291,9 +315,12 @@ export function ExcalidrawMenu({ editor }: EditorMenuProps) {
 
   return (
     <>
-      <BaseBubbleMenu
+      <NodeBubbleMenu
         editor={editor}
         pluginKey={`excalidraw-menu`}
+        ref={(element) => {
+          if (element) element.style.zIndex = "99";
+        }}
         updateDelay={0}
         getReferencedVirtualElement={getReferencedVirtualElement}
         options={{
@@ -359,6 +386,23 @@ export function ExcalidrawMenu({ editor }: EditorMenuProps) {
 
           <div className={classes.divider} />
 
+          <Tooltip position="top" label={t("Expand")} withinPortal={false}>
+            <ActionIcon
+              onClick={() =>
+                editorState?.src &&
+                setLightboxRequest({
+                  src: getFileUrl(editorState.src),
+                  type: "image",
+                })
+              }
+              size="lg"
+              aria-label={t("Expand")}
+              variant="subtle"
+            >
+              <IconZoomIn size={18} />
+            </ActionIcon>
+          </Tooltip>
+
           <Tooltip position="top" label={t("Edit")} withinPortal={false}>
             <ActionIcon
               onClick={handleOpen}
@@ -394,7 +438,7 @@ export function ExcalidrawMenu({ editor }: EditorMenuProps) {
           </Tooltip>
           </div>
         )}
-      </BaseBubbleMenu>
+      </NodeBubbleMenu>
 
       <ReactClearModal
         style={{
@@ -428,7 +472,7 @@ export function ExcalidrawMenu({ editor }: EditorMenuProps) {
         <div style={{ height: "90vh" }}>
           <Suspense fallback={null}>
             <ExcalidrawComponent
-              excalidrawAPI={(api) => setExcalidrawAPI(api)}
+              onExcalidrawAPI={(api) => setExcalidrawAPI(api)}
               onChange={(elements, _appState, files) => {
                 const fingerprint = `${elements.length}:${elements.reduce((s, e) => s + (e.version || 0), 0)}:${Object.keys(files).length}`;
                 if (isInitialLoadRef.current) {

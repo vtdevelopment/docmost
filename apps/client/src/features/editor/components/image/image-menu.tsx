@@ -1,8 +1,10 @@
-import { BubbleMenu as BaseBubbleMenu } from "@tiptap/react/menus";
+import { NodeBubbleMenu } from "@/features/editor/components/bubble-menu/node-bubble-menu";
 import { findParentNode, posToDOMRect, useEditorState } from "@tiptap/react";
 import React, { useCallback, useRef } from "react";
+import { useSetAtom } from "jotai";
 import { Node as PMNode } from "@tiptap/pm/model";
-import { isEditorReady } from "@docmost/editor-ext";
+import { isEditorReady, sanitizeUrl } from "@docmost/editor-ext";
+import { getEditorUploadTarget } from "@/features/editor/utils/upload-target";
 import {
   EditorMenuProps,
   ShouldShowProps,
@@ -14,18 +16,24 @@ import {
   IconLayoutAlignLeft,
   IconLayoutAlignRight,
   IconDownload,
+  IconExternalLink,
   IconRefresh,
   IconTrash,
+  IconZoomIn,
 } from "@tabler/icons-react";
 import { useTranslation } from "react-i18next";
 import { getFileUrl } from "@/lib/config.ts";
 import { uploadImageAction } from "@/features/editor/components/image/upload-image-action.tsx";
 import { useAltTextControl } from "@/features/editor/components/common/use-alt-text-control.tsx";
+import { lightboxRequestAtom } from "@/features/editor/atoms/editor-atoms";
 import classes from "../common/toolbar-menu.module.css";
+import { useImageLinkNavigation } from "./use-image-link-navigation";
 
 export function ImageMenu({ editor }: EditorMenuProps) {
   const { t } = useTranslation();
+  const handleImageLink = useImageLinkNavigation();
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const setLightboxRequest = useSetAtom(lightboxRequestAtom);
 
   const editorState = useEditorState({
     editor,
@@ -42,6 +50,7 @@ export function ImageMenu({ editor }: EditorMenuProps) {
         isAlignCenter: ctx.editor.isActive("image", { align: "center" }),
         isAlignRight: ctx.editor.isActive("image", { align: "right" }),
         src: imageAttrs?.src || null,
+        href: sanitizeUrl(imageAttrs?.href),
         alt: imageAttrs?.alt || "",
       };
     },
@@ -122,11 +131,10 @@ export function ImageMenu({ editor }: EditorMenuProps) {
       const file = e.target.files?.[0];
       if (!file) return;
 
-      // @ts-ignore
-      const pageId = editor.storage?.pageId;
-      if (pageId) {
+      const uploadTarget = getEditorUploadTarget(editor);
+      if (uploadTarget) {
         const pos = editor.state.selection.from;
-        uploadImageAction(file, editor, pos, pageId);
+        uploadImageAction(file, editor, pos, uploadTarget);
       }
       // Reset so the same file can be selected again
       e.target.value = "";
@@ -149,9 +157,12 @@ export function ImageMenu({ editor }: EditorMenuProps) {
   });
 
   return (
-    <BaseBubbleMenu
+    <NodeBubbleMenu
       editor={editor}
       pluginKey={`image-menu`}
+      ref={(element) => {
+        if (element) element.style.zIndex = "99";
+      }}
       updateDelay={0}
       getReferencedVirtualElement={getReferencedVirtualElement}
       options={{
@@ -207,6 +218,38 @@ export function ImageMenu({ editor }: EditorMenuProps) {
 
         <div className={classes.divider} />
 
+        {editorState?.href && (
+          <Tooltip position="top" label={t("Open link")} withinPortal={false}>
+            <ActionIcon
+              component="a"
+              href={editorState.href}
+              onClick={handleImageLink}
+              size="lg"
+              aria-label={t("Open link")}
+              variant="subtle"
+            >
+              <IconExternalLink size={18} />
+            </ActionIcon>
+          </Tooltip>
+        )}
+
+        <Tooltip position="top" label={t("Expand")} withinPortal={false}>
+          <ActionIcon
+            onClick={() =>
+              editorState?.src &&
+              setLightboxRequest({
+                src: getFileUrl(editorState.src),
+                type: "image",
+              })
+            }
+            size="lg"
+            aria-label={t("Expand")}
+            variant="subtle"
+          >
+            <IconZoomIn size={18} />
+          </ActionIcon>
+        </Tooltip>
+
         <Tooltip position="top" label={t("Download")} withinPortal={false}>
           <ActionIcon
             onClick={handleDownload}
@@ -249,7 +292,7 @@ export function ImageMenu({ editor }: EditorMenuProps) {
         style={{ display: "none" }}
         onChange={handleFileChange}
       />
-    </BaseBubbleMenu>
+    </NodeBubbleMenu>
   );
 }
 

@@ -15,13 +15,15 @@ import {
   IconLabel,
   IconSearch,
 } from "@tabler/icons-react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useParams, useSearchParams } from "react-router-dom";
 import { useTranslation } from "react-i18next";
-import { Helmet } from "react-helmet-async";
 import { useDebouncedValue } from "@mantine/hooks";
-import { getAppName } from "@/lib/config";
 import { useLabelPagesQuery } from "@/features/label/queries/label-query.ts";
-import { useGetSpacesQuery } from "@/features/space/queries/space-query.ts";
+import {
+  useGetSpacesQuery,
+  useUnlistedSpaceQuery,
+} from "@/features/space/queries/space-query.ts";
+import { includeSpace } from "@/features/space/space.utils.ts";
 import { getLabelColor } from "@/features/label/utils/label-colors.ts";
 import { LabelPageRow } from "@/features/label/components/label-page-row.tsx";
 import { LabelPageRowSkeleton } from "@/features/label/components/label-page-row-skeleton.tsx";
@@ -29,22 +31,38 @@ import { normalizeLabelName } from "@/features/label/utils/normalize-label.ts";
 import { SpaceFilterMenu } from "@/features/space/components/space-filter-menu.tsx";
 import { EmptyState } from "@/components/ui/empty-state";
 import classes from "@/features/label/label.module.css";
+import { DocumentTitle } from "@/components/ui/document-title.tsx";
 
 export default function LabelPage() {
   const { t } = useTranslation();
   const { labelName: rawName } = useParams<{ labelName: string }>();
-  const labelName = normalizeLabelName(decodeURIComponent(rawName ?? ""));
+  const labelName = normalizeLabelName(rawName ?? "");
   const scheme = useComputedColorScheme("light");
   const c = getLabelColor(labelName, scheme);
 
-  const [spaceId, setSpaceId] = useState<string | null>(null);
+  const [searchParams, setSearchParams] = useSearchParams();
+  const spaceId = searchParams.get("spaceId");
   const [search, setSearch] = useState("");
   const [debouncedSearch] = useDebouncedValue(search.trim(), 200);
 
   const activeSpaceId = spaceId ?? undefined;
 
+  const setSpaceId = (nextSpaceId: string | null) => {
+    const next = new URLSearchParams(searchParams);
+    if (nextSpaceId) {
+      next.set("spaceId", nextSpaceId);
+    } else {
+      next.delete("spaceId");
+    }
+    setSearchParams(next, { replace: true });
+  };
+
   const { data: spacesData } = useGetSpacesQuery({ limit: 100 });
-  const spaces = spacesData?.items ?? [];
+  const { data: filterSpace } = useUnlistedSpaceQuery(
+    spaceId,
+    spacesData?.items,
+  );
+  const spaces = includeSpace(spacesData?.items ?? [], filterSpace);
 
   const {
     data: pagesData,
@@ -82,11 +100,7 @@ export default function LabelPage() {
 
   return (
     <>
-      <Helmet>
-        <title>
-          {labelName} - {getAppName()}
-        </title>
-      </Helmet>
+      <DocumentTitle title={labelName} />
 
       <Container size={820} py="xl">
         <Stack gap="lg">

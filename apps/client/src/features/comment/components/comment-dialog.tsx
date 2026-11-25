@@ -1,9 +1,10 @@
 import React, { useState } from "react";
 import { Dialog, Group, Stack, Text } from "@mantine/core";
 import { useClickOutside } from "@mantine/hooks";
-import { useAtom } from "jotai";
+import { useAtom, useSetAtom } from "jotai";
 import {
   activeCommentIdAtom,
+  commentPanelTabAtom,
   draftCommentIdAtom,
   showCommentPopupAtom,
   showReadOnlyCommentPopupAtom,
@@ -11,6 +12,7 @@ import {
 } from "@/features/comment/atoms/comment-atom";
 import CommentEditor from "@/features/comment/components/comment-editor";
 import CommentActions from "@/features/comment/components/comment-actions";
+import { CommentErrorBoundary } from "@/features/comment/components/comment-error-boundary";
 import { currentUserAtom } from "@/features/user/atoms/current-user-atom";
 import { useCreateCommentMutation } from "@/features/comment/queries/comment-query";
 import { asideStateAtom } from "@/components/layouts/global/hooks/atoms/sidebar-atom";
@@ -32,6 +34,7 @@ function CommentDialog({ editor, pageId, readOnly }: CommentDialogProps) {
   const [, setShowReadOnlyCommentPopup] = useAtom(showReadOnlyCommentPopupAtom);
   const [readOnlyCommentData, setReadOnlyCommentData] = useAtom(readOnlyCommentDataAtom);
   const [, setActiveCommentId] = useAtom(activeCommentIdAtom);
+  const setCommentPanelTab = useSetAtom(commentPanelTabAtom);
   const [draftCommentId, setDraftCommentId] = useAtom(draftCommentIdAtom);
   const [currentUser] = useAtom(currentUserAtom);
   const [, setAsideState] = useAtom(asideStateAtom);
@@ -90,6 +93,7 @@ function CommentDialog({ editor, pageId, readOnly }: CommentDialogProps) {
         });
       }
       setActiveCommentId(createdComment.id);
+      setCommentPanelTab("open");
 
       setAsideState({ tab: "comments", isAsideOpen: true });
       setTimeout(() => {
@@ -121,6 +125,7 @@ function CommentDialog({ editor, pageId, readOnly }: CommentDialogProps) {
       });
 
       setActiveCommentId(createdComment.id);
+      setCommentPanelTab("open");
       setAsideState({ tab: "comments", isAsideOpen: true });
 
       setTimeout(() => {
@@ -170,14 +175,16 @@ function CommentDialog({ editor, pageId, readOnly }: CommentDialogProps) {
           </div>
         </Group>
 
-        <CommentEditor
-          onUpdate={handleCommentEditorChange}
-          onSave={handleAddComment}
-          placeholder={t("Write a comment")}
-          editable={true}
-          autofocus={true}
-        />
-        <CommentActions onSave={handleAddComment} isLoading={isPending} />
+        <CommentErrorBoundary>
+          <CommentEditor
+            onUpdate={handleCommentEditorChange}
+            onSave={handleAddComment}
+            placeholder={t("Write a comment")}
+            editable={true}
+            autofocus={true}
+          />
+          <CommentActions onSave={handleAddComment} isLoading={isPending} />
+        </CommentErrorBoundary>
       </Stack>
     </Dialog>
   );

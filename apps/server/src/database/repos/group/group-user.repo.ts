@@ -47,17 +47,35 @@ export class GroupUserRepo {
       .executeTakeFirst();
   }
 
-  async getGroupUsersPaginated(groupId: string, pagination: PaginationOptions) {
+  async getGroupUsersPaginated(
+    groupId: string,
+    pagination: PaginationOptions,
+    opts?: { adminView?: boolean },
+  ) {
     let query = this.db
       .selectFrom('groupUsers')
       .innerJoin('users', 'users.id', 'groupUsers.userId')
-      .selectAll('users')
+      .select(
+        this.userRepo.memberFields.map((field) => `users.${field}` as const),
+      )
+      .$if(opts?.adminView, (qb) =>
+        qb.select(
+          this.userRepo.adminFields.map((field) => `users.${field}` as const),
+        ),
+      )
+      .$if(!opts?.adminView, (qb) =>
+        qb.where('users.deactivatedAt', 'is', null),
+      )
       .where('groupId', '=', groupId);
 
     if (pagination.query) {
       query = query.where((eb) =>
         eb(
           sql`f_unaccent(users.name)`,
+          'ilike',
+          sql`f_unaccent(${'%' + pagination.query + '%'})`,
+        ).or(
+          sql`users.email`,
           'ilike',
           sql`f_unaccent(${'%' + pagination.query + '%'})`,
         ),
@@ -70,10 +88,6 @@ export class GroupUserRepo {
       beforeCursor: pagination.beforeCursor,
       fields: [{ expression: 'users.id', direction: 'asc', key: 'id' }],
       parseCursor: (cursor) => ({ id: cursor.id }),
-    });
-
-    result.items.map((user) => {
-      delete user.password;
     });
 
     return result;
@@ -139,6 +153,8 @@ export class GroupUserRepo {
           workspaceId,
           trx,
         );
+        if (!defaultGroup) return;
+
         await this.insertGroupUser(
           {
             userId,
@@ -151,8 +167,11 @@ export class GroupUserRepo {
     );
   }
 
-  async getUserIdsByGroupId(groupId: string): Promise<string[]> {
-    const rows = await this.db
+  async getUserIdsByGroupId(
+    groupId: string,
+    opts?: { trx?: KyselyTransaction },
+  ): Promise<string[]> {
+    const rows = await dbOrTx(this.db, opts?.trx)
       .selectFrom('groupUsers')
       .select('userId')
       .where('groupId', '=', groupId)

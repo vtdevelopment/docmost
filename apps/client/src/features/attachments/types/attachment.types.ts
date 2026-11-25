@@ -8,11 +8,21 @@ export interface IAttachment {
   type: string;
   creatorId: string;
   pageId: string | null;
+  templateId?: string | null;
   spaceId: string | null;
   workspaceId: string;
   createdAt: string;
   updatedAt: string;
   deletedAt: string | null;
+}
+
+export interface IPageAttachment extends IAttachment {
+  url: string;
+  creator: {
+    id: string;
+    name: string;
+    avatarUrl: string | null;
+  } | null;
 }
 
 export enum AvatarIconType {

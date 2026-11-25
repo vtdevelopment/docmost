@@ -1,5 +1,19 @@
-import { HeadingLevel, ShadingType } from 'docx';
+import {
+  BuilderElement,
+  CheckBoxUtil,
+  ExternalHyperlink,
+  FootnoteReferenceRun,
+  HeadingLevel,
+  Paragraph,
+  ShadingType,
+  TextRun,
+} from 'docx';
 import { Node } from 'prosemirror-model';
+import { sanitizeIntegrationUrl } from '../integration-link/integration-link';
+import { getFileNameFromUrl } from '../media-utils';
+import { sanitizeMicrosoftFileItems } from '../microsoft/microsoft-file';
+import { sanitizeMicrosoftFolderUrl } from '../microsoft/microsoft-folder';
+import { isInternalFileUrl } from '../utils';
 import {
   DocxSerializerAsync,
   MarkSerializer,
@@ -36,13 +50,12 @@ function toDocxColor(input?: string): string | undefined {
   return undefined;
 }
 
-// Images and diagrams embed via the image resolver; the URL (with its file
-// extension) is passed through so docx can infer the image type.
+// Images and diagrams embed via the image resolver, at the node's width and alignment.
 const renderImage: NodeSerializerAsync[string] = async (state, node) => {
   const src = node.attrs?.src || node.attrs?.attachmentId;
   if (src) {
     try {
-      await state.image(src, 100);
+      await state.image(src, node.attrs?.width, node.attrs?.align);
     } catch {
       // Unrenderable/missing image: skip rather than fail the whole export.
     }
@@ -52,8 +65,11 @@ const renderImage: NodeSerializerAsync[string] = async (state, node) => {
 
 // Non-embeddable media render as a labelled line.
 const renderFileLine: NodeSerializerAsync[string] = (state, node) => {
+  const src = node.attrs?.src || node.attrs?.url;
   const label =
-    node.attrs?.name || node.attrs?.src || node.attrs?.url || 'attachment';
+    node.attrs?.name ||
+    (isInternalFileUrl(src) ? getFileNameFromUrl(src) : src) ||
+    'attachment';
   state.text(label);
   state.closeBlock(node);
 };
@@ -63,6 +79,72 @@ const renderEmbedLine: NodeSerializerAsync[string] = (state, node) => {
   state.text(label);
   state.closeBlock(node);
 };
+
+const renderIntegrationMention: NodeSerializerAsync[string] = (state, node) => {
+  const url = sanitizeIntegrationUrl(node.attrs?.url);
+  if (!url) return;
+  state.current.push(
+    new ExternalHyperlink({
+      link: url,
+      children: [new TextRun({ text: url, style: 'Hyperlink' })],
+    }),
+  );
+};
+
+const renderIntegrationCard: NodeSerializerAsync[string] = async (
+  state,
+  node,
+  parent,
+  index,
+) => {
+  await renderIntegrationMention(state, node, parent, index);
+  state.closeBlock(node);
+};
+
+const renderMicrosoftFolder: NodeSerializerAsync[string] = (state, node) => {
+  const url = sanitizeMicrosoftFolderUrl(node.attrs?.webUrl);
+  const name = typeof node.attrs?.name === 'string' ? node.attrs.name : '';
+  if (url) {
+    state.current.push(
+      new ExternalHyperlink({
+        link: url,
+        children: [new TextRun({ text: name || url, style: 'Hyperlink' })],
+      }),
+    );
+  } else {
+    state.text(name);
+  }
+  state.closeBlock(node);
+};
+
+const renderMicrosoftFile: NodeSerializerAsync[string] = (state, node) => {
+  for (const item of sanitizeMicrosoftFileItems(node.attrs?.items)) {
+    state.current.push(
+      new ExternalHyperlink({
+        link: item.webUrl,
+        children: [
+          new TextRun({ text: item.name || item.webUrl, style: 'Hyperlink' }),
+        ],
+      }),
+    );
+    state.closeBlock(node);
+  }
+};
+
+// Word's checkbox content control. docx's CheckBox writes the glyph as a w:sym, which other
+// readers misdraw, so it goes in as text the way Word writes it.
+function createCheckBox(checked: boolean) {
+  return new BuilderElement({
+    name: 'w:sdt',
+    children: [
+      new BuilderElement({ name: 'w:sdtPr', children: [new CheckBoxUtil({ checked })] }),
+      new BuilderElement({
+        name: 'w:sdtContent',
+        children: [new TextRun({ text: checked ? '☒' : '☐', font: 'MS Gothic' })],
+      }),
+    ],
+  });
+}
 
 export const defaultAsyncNodes: NodeSerializerAsync = {
   text(state, node) {
@@ -108,13 +190,15 @@ export const defaultAsyncNodes: NodeSerializerAsync = {
     await state.renderListItem(node);
   },
   async taskList(state, node) {
-    await state.renderList(node, 'bullets');
+    await state.renderList(node, 'tasks');
   },
   async taskItem(state, node) {
     if (state.currentNumbering) {
       state.addParagraphOptions({ numbering: state.currentNumbering });
     }
-    state.text(node.attrs?.checked ? '☑ ' : '☐ ');
+    // a checkbox content control, which the reader can tick in Word
+    state.current.push(createCheckBox(Boolean(node.attrs?.checked)));
+    state.text(' ');
     await state.renderContent(node);
   },
   async table(state, node) {
@@ -137,6 +221,10 @@ export const defaultAsyncNodes: NodeSerializerAsync = {
   attachment: renderFileLine,
   embed: renderEmbedLine,
   youtube: renderEmbedLine,
+  integrationCard: renderIntegrationCard,
+  integrationMention: renderIntegrationMention,
+  microsoftFolder: renderMicrosoftFolder,
+  microsoftFile: renderMicrosoftFile,
   async callout(state, node) {
     await state.renderContent(node, { style: 'IntenseQuote' });
   },
@@ -145,9 +233,22 @@ export const defaultAsyncNodes: NodeSerializerAsync = {
   },
   async detailsSummary(state, node) {
     await state.renderInline(node);
-    state.closeBlock(node, { heading: HeadingLevel.HEADING_4 });
+    state.closeBlock(node, { style: 'DetailsSummary' });
   },
   async detailsContent(state, node) {
+    await state.renderContent(node, { style: 'DetailsContent' });
+  },
+  async tabs(state, node) {
+    await state.renderContent(node);
+  },
+  async tab(state, node) {
+    await state.renderContent(node);
+  },
+  async tabLabel(state, node) {
+    await state.renderInline(node);
+    state.closeBlock(node, { heading: HeadingLevel.HEADING_4 });
+  },
+  async tabPanel(state, node) {
     await state.renderContent(node);
   },
   async columns(state, node) {
@@ -165,12 +266,47 @@ export const defaultAsyncNodes: NodeSerializerAsync = {
   status(state, node) {
     state.text(`[${node.attrs?.text ?? ''}]`);
   },
+  date(state, node) {
+    state.text(node.textContent);
+  },
+  recentlyUpdated(state, node) {
+    if (node.textContent) {
+      state.text(node.textContent);
+      state.closeBlock(node);
+    }
+  },
+  itemsByLabel(state, node) {
+    state.text(node.attrs.heading || 'Pages by label');
+    state.closeBlock(node);
+  },
   pageBreak(state, node) {
     state.closeBlock(node, { pageBreakBefore: true });
   },
+  footnoteReference(state, node) {
+    const number =
+      Number(node.attrs?.referenceNumber) || state.$footnoteCounter + 1;
+    state.$footnoteCounter = Math.max(state.$footnoteCounter, number);
+    // seed an empty body so the reference stays valid even if the trailing
+    // footnotes list is missing; the footnotes node overwrites it with content
+    if (!state.footnotes[number]) {
+      state.footnotes[number] = { children: [new Paragraph('')] };
+    }
+    state.current.push(new FootnoteReferenceRun(number));
+  },
+  async footnotes(state, node) {
+    for (let i = 0; i < node.childCount; i += 1) {
+      const item = node.child(i);
+      const number =
+        Number(String(item.attrs?.id ?? '').replace('fn:', '')) || i + 1;
+      await state.footnoteDefinition(item, number);
+    }
+  },
+  // items are consumed by the footnotes handler above
+  footnote() {},
   // No usable static export representation: skip without failing.
   subpages() {},
   transclusionReference() {},
+  base() {},
 };
 
 export const defaultMarks: MarkSerializer = {
@@ -286,6 +422,25 @@ export async function pageNodeToDocxBuffer(
               },
             },
           },
+          // Toggle blocks show expanded, without entering the outline as headings do.
+          paragraphStyles: [
+            {
+              id: 'DetailsSummary',
+              name: 'Toggle Summary',
+              basedOn: 'Normal',
+              next: 'DetailsContent',
+              quickFormat: true,
+              run: { bold: true },
+              paragraph: { keepNext: true },
+            },
+            {
+              id: 'DetailsContent',
+              name: 'Toggle Content',
+              basedOn: 'Normal',
+              quickFormat: true,
+              paragraph: { indent: { left: 360 } },
+            },
+          ],
         },
       }) as any,
   );

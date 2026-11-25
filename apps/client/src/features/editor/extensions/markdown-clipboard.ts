@@ -1,9 +1,13 @@
 // adapted from: https://github.com/aguingand/tiptap-markdown/blob/main/src/extensions/tiptap/clipboard.js - MIT
 import { Extension } from "@tiptap/core";
-import { Plugin, PluginKey, TextSelection } from "@tiptap/pm/state";
+import { Plugin, PluginKey } from "@tiptap/pm/state";
 import { DOMParser, DOMSerializer, Fragment, Slice } from "@tiptap/pm/model";
 import { find } from "linkifyjs";
-import { markdownToHtml, htmlToMarkdown } from "@docmost/editor-ext";
+import {
+  markdownToHtml,
+  htmlToMarkdown,
+  withoutTemplatePlaceholders,
+} from "@docmost/editor-ext";
 
 export const MarkdownClipboard = Extension.create({
   name: "markdownClipboard",
@@ -36,7 +40,9 @@ export const MarkdownClipboard = Extension.create({
 
             const div = document.createElement("div");
             const serializer = DOMSerializer.fromSchema(this.editor.schema);
-            const fragment = serializer.serializeFragment(slice.content);
+            const fragment = serializer.serializeFragment(
+              withoutTemplatePlaceholders(slice.content),
+            );
             div.appendChild(fragment);
             return htmlToMarkdown(div.innerHTML);
           },
@@ -77,7 +83,6 @@ export const MarkdownClipboard = Extension.create({
             }
 
             const { tr } = view.state;
-            const { from, to } = view.state.selection;
 
             const parsed = markdownToHtml(text.replace(/\n+$/, ""));
             const body = elementFromString(parsed);
@@ -89,9 +94,7 @@ export const MarkdownClipboard = Extension.create({
               preserveWhitespace: true,
             });
 
-            tr.replaceRange(from, to, contentNodes);
-            const insertEnd = tr.mapping.map(from, 1);
-            tr.setSelection(TextSelection.near(tr.doc.resolve(Math.max(from, insertEnd - 2)), -1));
+            tr.replaceSelection(closeIsolatingNodes(contentNodes));
             tr.setMeta('paste', true)
             view.dispatch(tr);
             return true;
@@ -109,7 +112,9 @@ export const MarkdownClipboard = Extension.create({
               const lastChild = content.lastChild;
               if (
                 lastChild?.type.name === "paragraph" &&
-                lastChild.textContent.trim() === ""
+                lastChild.content.content.every(
+                  (node) => node.type.name === "hardBreak" || (node.isText && !node.text.trim()),
+                )
               ) {
                 const children = [];
                 for (let i = 0; i < content.childCount - 1; i++) {
@@ -140,7 +145,70 @@ function elementFromString(value) {
   return new window.DOMParser().parseFromString(wrappedValue, "text/html").body;
 }
 
-const DEFAULT_PASTE_COL_WIDTH_PX = 150;
+// MIT - https://github.com/ProseMirror/prosemirror-view/blob/master/src/clipboard.ts
+// Closes tables, callouts and other isolating nodes, as ProseMirror's own paste does, so the text after the cursor stays out of them.
+function closeIsolatingNodes(slice: Slice): Slice {
+  let openStart = 0;
+  let openEnd = 0;
+  for (
+    let node = slice.content.firstChild;
+    openStart < slice.openStart && !node.type.spec.isolating;
+    node = node.firstChild
+  ) {
+    openStart++;
+  }
+  for (
+    let node = slice.content.lastChild;
+    openEnd < slice.openEnd && !node.type.spec.isolating;
+    node = node.lastChild
+  ) {
+    openEnd++;
+  }
+
+  if (openStart < slice.openStart) {
+    slice = new Slice(
+      closeRange(slice.content, -1, openStart, slice.openStart, 0, slice.openEnd),
+      openStart,
+      slice.openEnd,
+    );
+  }
+  if (openEnd < slice.openEnd) {
+    slice = new Slice(
+      closeRange(slice.content, 1, openEnd, slice.openEnd, 0, 0),
+      slice.openStart,
+      openEnd,
+    );
+  }
+  return slice;
+}
+
+function closeRange(
+  fragment: Fragment,
+  side: number,
+  from: number,
+  to: number,
+  depth: number,
+  openEnd: number,
+): Fragment {
+  const node = side < 0 ? fragment.firstChild : fragment.lastChild;
+  let inner = node.content;
+  if (fragment.childCount > 1) openEnd = 0;
+  if (depth < to - 1) {
+    inner = closeRange(inner, side, from, to, depth + 1, openEnd);
+  }
+  if (depth >= from) {
+    inner =
+      side < 0
+        ? node.contentMatchAt(0).fillBefore(inner, openEnd <= depth).append(inner)
+        : inner.append(
+            node.contentMatchAt(node.childCount).fillBefore(Fragment.empty, true),
+          );
+  }
+  return fragment.replaceChild(
+    side < 0 ? 0 : fragment.childCount - 1,
+    node.copy(inner),
+  );
+}
 
 function parsePixelWidth(el: Element): number | null {
   const attr = el.getAttribute("width");
@@ -190,26 +258,14 @@ function deriveColumnWidths(table: Element): (number | null)[] | null {
   return widths;
 }
 
-// Mirror of server normalizeTableColumnWidths (see import/utils/table-utils.ts):
-// markdown source has no widths, so without this every pasted table renders
-// at table-layout:fixed/100% and squashes columns to fit the editor instead of
-// letting .tableWrapper's overflow-x: auto scroll.
+// Preserve source widths as in the server's import normalizer.
 export function normalizeTableColumnWidths(root: Element): void {
   root.querySelectorAll("table").forEach((table) => {
     const firstRow = getFirstRow(table);
     if (!firstRow) return;
 
-    let colWidths = deriveColumnWidths(table);
-    if (!colWidths) {
-      let count = 0;
-      Array.from(firstRow.children)
-        .filter((c) => c.tagName === "TD" || c.tagName === "TH")
-        .forEach((cell) => {
-          count += parseInt(cell.getAttribute("colspan") || "1", 10) || 1;
-        });
-      if (count === 0) return;
-      colWidths = new Array(count).fill(DEFAULT_PASTE_COL_WIDTH_PX);
-    }
+    const colWidths = deriveColumnWidths(table);
+    if (!colWidths) return;
 
     let col = 0;
     Array.from(firstRow.children)
@@ -220,10 +276,10 @@ export function normalizeTableColumnWidths(root: Element): void {
           return;
         }
         const colspan = parseInt(cell.getAttribute("colspan") || "1", 10) || 1;
-        const slice = colWidths!.slice(col, col + colspan);
+        const slice = colWidths.slice(col, col + colspan);
         col += colspan;
         if (slice.length === 0 || slice.every((w) => w === null)) return;
-        const values = slice.map((w) => (w == null ? 100 : w));
+        const values = slice.map((w) => w ?? 0);
         cell.setAttribute("colwidth", values.join(","));
       });
   });

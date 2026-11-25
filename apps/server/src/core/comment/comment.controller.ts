@@ -12,10 +12,12 @@ import {
 import { CommentService } from './comment.service';
 import { CreateCommentDto } from './dto/create-comment.dto';
 import { UpdateCommentDto } from './dto/update-comment.dto';
+import { ResolveCommentDto } from './dto/resolve-comment.dto';
 import { PageIdDto, CommentIdDto } from './dto/comments.input';
 import { AuthUser } from '../../common/decorators/auth-user.decorator';
 import { AuthWorkspace } from '../../common/decorators/auth-workspace.decorator';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
+import { OAuthScope } from '../../common/decorators/oauth-scope.decorator';
 import { PaginationOptions } from '@docmost/db/pagination/pagination-options';
 import { User, Workspace } from '@docmost/db/types/entity.types';
 import SpaceAbilityFactory from '../casl/abilities/space-ability.factory';
@@ -32,6 +34,7 @@ import {
   IAuditService,
 } from '../../integrations/audit/audit.service';
 import { WsService } from '../../ws/ws.service';
+import { ApiKeyScope } from '../../common/decorators/api-key-scope.decorator';
 
 @UseGuards(JwtAuthGuard)
 @Controller('comments')
@@ -48,13 +51,14 @@ export class CommentController {
 
   @HttpCode(HttpStatus.OK)
   @Post('create')
+  @OAuthScope('write')
   async create(
     @Body() createCommentDto: CreateCommentDto,
     @AuthUser() user: User,
     @AuthWorkspace() workspace: Workspace,
   ) {
     const page = await this.pageRepo.findById(createCommentDto.pageId);
-    if (!page || page.deletedAt) {
+    if (!page || page.workspaceId !== workspace.id || page.deletedAt) {
       throw new NotFoundException('Page not found');
     }
 
@@ -84,14 +88,16 @@ export class CommentController {
 
   @HttpCode(HttpStatus.OK)
   @Post('/')
+  @OAuthScope('read')
   async findPageComments(
     @Body() input: PageIdDto,
     @Body()
     pagination: PaginationOptions,
     @AuthUser() user: User,
+    @AuthWorkspace() workspace: Workspace,
   ) {
     const page = await this.pageRepo.findById(input.pageId);
-    if (!page) {
+    if (!page || page.workspaceId !== workspace.id || page.deletedAt) {
       throw new NotFoundException('Page not found');
     }
 
@@ -100,16 +106,21 @@ export class CommentController {
     return this.commentService.findByPageId(page.id, pagination);
   }
 
+  @ApiKeyScope('read')
   @HttpCode(HttpStatus.OK)
   @Post('info')
-  async findOne(@Body() input: CommentIdDto, @AuthUser() user: User) {
+  async findOne(
+    @Body() input: CommentIdDto,
+    @AuthUser() user: User,
+    @AuthWorkspace() workspace: Workspace,
+  ) {
     const comment = await this.commentRepo.findById(input.commentId);
     if (!comment) {
       throw new NotFoundException('Comment not found');
     }
 
     const page = await this.pageRepo.findById(comment.pageId);
-    if (!page) {
+    if (!page || page.workspaceId !== workspace.id || page.deletedAt) {
       throw new NotFoundException('Page not found');
     }
 
@@ -120,11 +131,48 @@ export class CommentController {
 
   @HttpCode(HttpStatus.OK)
   @Post('update')
+  @OAuthScope('write')
   async update(@Body() dto: UpdateCommentDto, @AuthUser() user: User, @AuthWorkspace() workspace: Workspace) {
     const comment = await this.commentRepo.findById(dto.commentId, {
       includeCreator: true,
       includeResolvedBy: true,
     });
+    if (!comment) {
+      throw new NotFoundException('Comment not found');
+    }
+
+    const page = await this.pageRepo.findById(comment.pageId);
+    if (!page || page.workspaceId !== workspace.id || page.deletedAt) {
+      throw new NotFoundException('Page not found');
+    }
+
+    await this.pageAccessService.validateCanComment(page, user, workspace.id);
+
+    const updatedComment = await this.commentService.update(comment, dto, user);
+
+    this.auditService.log({
+      event: AuditEvent.COMMENT_UPDATED,
+      resourceType: AuditResource.COMMENT,
+      resourceId: comment.id,
+      spaceId: comment.spaceId,
+      metadata: {
+        pageId: comment.pageId,
+      },
+    });
+
+    return updatedComment;
+  }
+
+  @HttpCode(HttpStatus.OK)
+  @Post('resolve')
+  async resolve(
+    @Body() resolveCommentDto: ResolveCommentDto,
+    @AuthUser() user: User,
+    @AuthWorkspace() workspace: Workspace,
+  ) {
+    const comment = await this.commentRepo.findById(
+      resolveCommentDto.commentId,
+    );
     if (!comment) {
       throw new NotFoundException('Comment not found');
     }
@@ -136,7 +184,34 @@ export class CommentController {
 
     await this.pageAccessService.validateCanComment(page, user, workspace.id);
 
-    return this.commentService.update(comment, dto, user);
+    let canEdit = true;
+    try {
+      await this.pageAccessService.validateCanEdit(page, user);
+    } catch {
+      canEdit = false;
+    }
+
+    const resolvedComment = await this.commentService.resolve(
+      comment,
+      resolveCommentDto.resolved,
+      user,
+      // Viewers cannot modify the Ydoc directly; the server must apply the mark for them
+      { updateYjsMark: !canEdit },
+    );
+
+    this.auditService.log({
+      event: resolveCommentDto.resolved
+        ? AuditEvent.COMMENT_RESOLVED
+        : AuditEvent.COMMENT_REOPENED,
+      resourceType: AuditResource.COMMENT,
+      resourceId: comment.id,
+      spaceId: comment.spaceId,
+      metadata: {
+        pageId: comment.pageId,
+      },
+    });
+
+    return resolvedComment;
   }
 
   @HttpCode(HttpStatus.OK)
@@ -148,7 +223,7 @@ export class CommentController {
     }
 
     const page = await this.pageRepo.findById(comment.pageId);
-    if (!page) {
+    if (!page || page.workspaceId !== workspace.id || page.deletedAt) {
       throw new NotFoundException('Page not found');
     }
 

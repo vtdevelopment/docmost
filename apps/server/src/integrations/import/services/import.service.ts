@@ -10,9 +10,10 @@ import {
 import { InjectKysely } from 'nestjs-kysely';
 import { KyselyDB } from '@docmost/db/types/kysely.types';
 import {
+  bufferMultipartFile,
   generateSlugId,
   sanitizeFileName,
-  createByteCountingStream,
+  streamMultipartFile,
 } from '../../../common/helpers';
 import { generateJitteredKeyBetween } from 'fractional-indexing-jittered';
 import { TiptapTransformer } from '@hocuspocus/transformer';
@@ -29,7 +30,7 @@ import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { QueueJob, QueueName } from '../../queue/constants';
 import { ModuleRef } from '@nestjs/core';
-import { load } from 'cheerio';
+import { loadImportHtml } from '../utils/import-dates';
 import { normalizeImportHtml } from '../utils/import-formatter';
 
 @Injectable()
@@ -52,7 +53,7 @@ export class ImportService {
     workspaceId: string,
   ) {
     const file = await filePromise;
-    const fileBuffer = await file.toBuffer();
+    const fileBuffer = await bufferMultipartFile(file);
     const fileExtension = path.extname(file.filename).toLowerCase();
     const fileName = sanitizeFileName(
       path.basename(file.filename, fileExtension),
@@ -72,7 +73,7 @@ export class ImportService {
       if (fileExtension.endsWith('.md')) {
         prosemirrorState = await this.processMarkdown(fileContent);
       } else if (fileExtension.endsWith('.html')) {
-        prosemirrorState = await this.processHTML(fileContent);
+        prosemirrorState = await this.processHTML(fileContent, spaceId);
       } else if (fileExtension.endsWith('.docx')) {
         prosemirrorState = await this.processDocx(
           fileBuffer,
@@ -149,10 +150,10 @@ export class ImportService {
     }
   }
 
-  async processHTML(htmlInput: string): Promise<any> {
+  async processHTML(htmlInput: string, spaceId?: string): Promise<any> {
     try {
-      const $ = load(htmlInput);
-      normalizeImportHtml($, $.root());
+      const $ = loadImportHtml(htmlInput);
+      normalizeImportHtml($, $.root(), spaceId);
       return htmlToJson($.html() || '');
     } catch (err) {
       throw err;
@@ -257,9 +258,13 @@ export class ImportService {
     const content = prosemirrorState.content ?? [];
     const firstNode = content[0];
 
+    // Keep headings with inline dates or bookmarks in the editable body.
     const isTitleHeading =
       firstNode?.type === 'heading' &&
-      (opts?.anyHeadingLevel || firstNode.attrs?.level === 1);
+      (opts?.anyHeadingLevel || firstNode.attrs?.level === 1) &&
+      !firstNode.content?.some(
+        (node) => node.type === 'date' || node.type === 'sectionAnchor',
+      );
 
     if (isTitleHeading) {
       const headingText = (firstNode.content ?? [])
@@ -334,11 +339,9 @@ export class ImportService {
     const filePath = `${getFileTaskFolderPath(FileTaskType.Import, workspaceId)}/${fileTaskId}/${fileNameWithExt}`;
 
     // upload file
-    const { stream, getBytesRead } = createByteCountingStream(file.file);
-
-    await this.storageService.upload(filePath, stream);
-
-    const fileSize = getBytesRead();
+    const fileSize = await streamMultipartFile(file, (stream) =>
+      this.storageService.upload(filePath, stream),
+    );
 
     const fileTask = await this.db
       .insertInto('fileTasks')

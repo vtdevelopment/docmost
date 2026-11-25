@@ -9,6 +9,7 @@ import {
   Text,
   UnstyledButton,
   Button,
+  MultiSelect,
 } from "@mantine/core";
 import { IconPlus, IconTrash } from "@tabler/icons-react";
 import {
@@ -18,10 +19,7 @@ import {
   FilterOperator,
 } from "@/ee/base/types/base.types";
 import { useTranslation } from "react-i18next";
-import {
-  getDescriptor,
-  DEFAULT_FILTER_OPERATORS,
-} from "@/ee/base/property-types/property-type.registry";
+import { filterSpecOf } from "@/ee/base/property-types/property-type.registry";
 import { FilterPersonInput } from "./filter-person-input";
 import { FilterDateInput } from "./filter-date-input";
 import { useEscapeClose } from "@/ee/base/hooks/use-escape-close";
@@ -52,6 +50,9 @@ const NO_VALUE_OPERATORS: FilterOperator[] = ["isEmpty", "isNotEmpty"];
 // stored value so a stale shape isn't sent to the engine.
 function valueClass(op: FilterOperator, inputKind: string): string {
   if (NO_VALUE_OPERATORS.includes(op)) return "none";
+  if (inputKind === "choices") {
+    return op === "any" || op === "none" ? "choicesMulti" : "choicesSingle";
+  }
   if (inputKind === "person") {
     return op === "any" || op === "none" ? "personMulti" : "personSingle";
   }
@@ -61,13 +62,8 @@ function valueClass(op: FilterOperator, inputKind: string): string {
   return "scalar";
 }
 
-function inputKindForProperty(property: IBaseProperty | undefined): string {
-  return getDescriptor(property?.type ?? "")?.filterInput ?? "text";
-}
-
-function getOperatorsForType(type: string): FilterOperator[] {
-  return (getDescriptor(type)?.filterOperators ??
-    DEFAULT_FILTER_OPERATORS) as FilterOperator[];
+function isMultiChoice(op: FilterCondition["op"]): boolean {
+  return op === "any" || op === "none";
 }
 
 function FilterValueInput({
@@ -81,19 +77,24 @@ function FilterValueInput({
   onChange: (value: unknown) => void;
   t: (key: string) => string;
 }) {
+  const textValue =
+    typeof condition.value === "string" || typeof condition.value === "number"
+      ? String(condition.value)
+      : "";
+
   if (!property) {
     return (
       <TextInput
         size="xs"
         placeholder={t("Value")}
-        value={(condition.value as string) ?? ""}
+        value={textValue}
         onChange={(e) => onChange(e.currentTarget.value)}
         w={100}
       />
     );
   }
 
-  const kind = getDescriptor(property.type)?.filterInput ?? "text";
+  const kind = filterSpecOf(property).input;
 
   if (kind === "person") {
     return (
@@ -121,6 +122,32 @@ function FilterValueInput({
     const typeOptions = property.typeOptions as SelectTypeOptions | undefined;
     const choices = typeOptions?.choices ?? [];
     const choiceOptions = choices.map((c) => ({ value: c.id, label: c.name }));
+
+    if (isMultiChoice(condition.op)) {
+      const { value } = condition;
+      const selected = (
+        Array.isArray(value) ? value : value ? [value] : []
+      ).filter((id) => choices.some((c) => c.id === id));
+
+      return (
+        <MultiSelect
+          size="xs"
+          data={choiceOptions}
+          comboboxProps={{ withinPortal: false }}
+          value={selected}
+          onChange={(values) => onChange(values)}
+          w={160}
+          styles={{
+            pillsList: {
+              maxHeight: 70,
+              overflowY: "auto",
+            },
+          }}
+          maxDropdownHeight={220}
+        />
+      );
+    }
+
     return (
       <Select
         size="xs"
@@ -140,7 +167,7 @@ function FilterValueInput({
         size="xs"
         type="number"
         placeholder={t("Value")}
-        value={(condition.value as string) ?? ""}
+        value={textValue}
         onChange={(e) => onChange(e.currentTarget.value)}
         w={100}
       />
@@ -167,7 +194,7 @@ function FilterValueInput({
     <TextInput
       size="xs"
       placeholder={t("Value")}
-      value={(condition.value as string) ?? ""}
+      value={textValue}
       onChange={(e) => onChange(e.currentTarget.value)}
       w={100}
     />
@@ -199,16 +226,23 @@ export function ViewFilterConfigPopover({
     label: p.name,
   }));
 
+  const [unSaved, setUnSaved] = useState(false)
   const [draft, setDraft] = useState<FilterCondition | null>(null);
+  const [draftConditions, setDraftConditions] =
+    useState<FilterCondition[]>(conditions);
 
   useEffect(() => {
-    if (!opened) setDraft(null);
-  }, [opened]);
+    if (opened) {
+      setDraftConditions(conditions);
+      setDraft(null);
+      setUnSaved(false)
+    }
+  }, [opened, conditions]);
 
   const handleStartDraft = useCallback(() => {
     const firstProperty = properties[0];
     if (!firstProperty) return;
-    const validOperators = getOperatorsForType(firstProperty.type);
+    const validOperators = filterSpecOf(firstProperty).operators;
     const defaultOperator = validOperators.includes("contains")
       ? ("contains" as FilterOperator)
       : validOperators[0];
@@ -216,14 +250,21 @@ export function ViewFilterConfigPopover({
   }, [properties]);
 
   const handleSaveDraft = useCallback(() => {
-    if (!draft) return;
-    onChange([...conditions, draft]);
+    const nextConditions = draft
+      ? [...draftConditions, draft]
+      : draftConditions;
+
+    onChange(nextConditions);
     setDraft(null);
-  }, [draft, conditions, onChange]);
+    setUnSaved(false)
+
+  }, [draft, draftConditions, onChange]);
 
   const handleCancelDraft = useCallback(() => {
+    setDraftConditions(conditions)
     setDraft(null);
-  }, []);
+    setUnSaved(false)
+  }, [conditions]);
 
   const handleDraftPropertyChange = useCallback(
     (propertyId: string | null) => {
@@ -233,12 +274,12 @@ export function ViewFilterConfigPopover({
         setDraft({ ...draft, propertyId });
         return;
       }
-      const validOperators = getOperatorsForType(newProperty.type);
+      const validOperators = filterSpecOf(newProperty).operators;
       const currentOperatorValid = validOperators.includes(draft.op);
+      const oldProperty = properties.find((p) => p.id === draft.propertyId);
       const sameKind =
-        inputKindForProperty(
-          properties.find((p) => p.id === draft.propertyId),
-        ) === inputKindForProperty(newProperty);
+        (oldProperty ? filterSpecOf(oldProperty).input : "text") ===
+        filterSpecOf(newProperty).input;
       setDraft({
         ...draft,
         propertyId,
@@ -253,9 +294,8 @@ export function ViewFilterConfigPopover({
     (operator: string | null) => {
       if (!operator || !draft) return;
       const op = operator as FilterOperator;
-      const kind = inputKindForProperty(
-        properties.find((p) => p.id === draft.propertyId),
-      );
+      const draftProperty = properties.find((p) => p.id === draft.propertyId);
+      const kind = draftProperty ? filterSpecOf(draftProperty).input : "text";
       const keep = valueClass(draft.op, kind) === valueClass(op, kind);
       setDraft({ ...draft, op, value: keep ? draft.value : undefined });
     },
@@ -272,25 +312,27 @@ export function ViewFilterConfigPopover({
 
   const handleRemove = useCallback(
     (index: number) => {
-      onChange(conditions.filter((_, i) => i !== index));
+      setUnSaved(true);
+      setDraftConditions((current) => current.filter((_, i) => i !== index));
     },
-    [conditions, onChange],
+    [],
   );
 
   const handlePropertyChange = useCallback(
     (index: number, propertyId: string | null) => {
       if (!propertyId) return;
       const newProperty = properties.find((p) => p.id === propertyId);
-      onChange(
-        conditions.map((f, i) => {
+      setUnSaved(true)
+      setDraftConditions((current) =>
+        current.map((f, i) => {
           if (i !== index) return f;
           if (newProperty) {
-            const validOperators = getOperatorsForType(newProperty.type);
+            const validOperators = filterSpecOf(newProperty).operators;
             const currentOperatorValid = validOperators.includes(f.op);
+            const oldProperty = properties.find((p) => p.id === f.propertyId);
             const sameKind =
-              inputKindForProperty(
-                properties.find((p) => p.id === f.propertyId),
-              ) === inputKindForProperty(newProperty);
+              (oldProperty ? filterSpecOf(oldProperty).input : "text") ===
+              filterSpecOf(newProperty).input;
             return {
               ...f,
               propertyId,
@@ -302,34 +344,35 @@ export function ViewFilterConfigPopover({
         }),
       );
     },
-    [conditions, properties, onChange],
+    [properties],
   );
 
   const handleOperatorChange = useCallback(
     (index: number, operator: string | null) => {
       if (!operator) return;
       const op = operator as FilterOperator;
-      onChange(
-        conditions.map((f, i) => {
+      setUnSaved(true)
+      setDraftConditions((current) =>
+        current.map((f, i) => {
           if (i !== index) return f;
-          const kind = inputKindForProperty(
-            properties.find((p) => p.id === f.propertyId),
-          );
+          const conditionProperty = properties.find((p) => p.id === f.propertyId);
+          const kind = conditionProperty ? filterSpecOf(conditionProperty).input : "text";
           const keep = valueClass(f.op, kind) === valueClass(op, kind);
           return { ...f, op, value: keep ? f.value : undefined };
         }),
       );
     },
-    [conditions, properties, onChange],
+    [properties],
   );
 
   const handleValueChange = useCallback(
     (index: number, value: unknown) => {
-      onChange(
-        conditions.map((f, i) => (i === index ? { ...f, value } : f)),
+      setUnSaved(true)
+      setDraftConditions((current) =>
+        current.map((f, i) => (i === index ? { ...f, value } : f)),
       );
     },
-    [conditions, onChange],
+    [],
   );
 
   return (
@@ -362,19 +405,19 @@ export function ViewFilterConfigPopover({
             {t("Filter by")}
           </Text>
 
-          {conditions.length === 0 && !draft && (
+          {draftConditions.length === 0 && !draft && (
             <Text size="xs" c="dimmed">
               {t("No filters applied")}
             </Text>
           )}
 
-          {conditions.map((condition, index) => {
+          {draftConditions.map((condition, index) => {
             const needsValue = !NO_VALUE_OPERATORS.includes(condition.op);
             const property = properties.find(
               (p) => p.id === condition.propertyId,
             );
             const validOperators = property
-              ? getOperatorsForType(property.type)
+              ? filterSpecOf(property).operators
               : OPERATORS.map((op) => op.value);
             const operatorOptions = OPERATORS.filter((op) =>
               validOperators.includes(op.value),
@@ -431,7 +474,7 @@ export function ViewFilterConfigPopover({
             const needsValue = !NO_VALUE_OPERATORS.includes(draft.op);
             const property = properties.find((p) => p.id === draft.propertyId);
             const validOperators = property
-              ? getOperatorsForType(property.type)
+              ? filterSpecOf(property).operators
               : OPERATORS.map((op) => op.value);
             const operatorOptions = OPERATORS.filter((op) =>
               validOperators.includes(op.value),
@@ -471,14 +514,6 @@ export function ViewFilterConfigPopover({
                     />
                   )}
                 </Group>
-                <Group justify="flex-end" gap="xs">
-                  <Button variant="default" size="xs" onClick={handleCancelDraft}>
-                    {t("Cancel")}
-                  </Button>
-                  <Button size="xs" onClick={handleSaveDraft}>
-                    {t("Save")}
-                  </Button>
-                </Group>
               </Stack>
             );
           })()}
@@ -492,6 +527,20 @@ export function ViewFilterConfigPopover({
               {t("Add filter")}
             </UnstyledButton>
           )}
+          <Group justify="flex-end" gap="xs">
+            <Button
+              variant="default"
+              size="xs"
+              onClick={handleCancelDraft}
+              disabled={!draft && !unSaved}
+            >
+              {t("Cancel")}
+            </Button>
+
+            <Button size="xs" onClick={handleSaveDraft} disabled={!draft && !unSaved}>
+              {t("Save")}
+            </Button>
+          </Group>
         </Stack>
       </Popover.Dropdown>
     </Popover>

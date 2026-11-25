@@ -13,8 +13,10 @@ import {
   IconKey,
   IconWorld,
   IconSparkles,
+  IconPlug,
   IconHistory,
   IconShieldCheck,
+  IconSpeakerphone,
 } from "@tabler/icons-react";
 import { Link, useLocation } from "react-router-dom";
 import classes from "./settings.module.css";
@@ -23,6 +25,7 @@ import { isCloud } from "@/lib/config.ts";
 import useUserRole from "@/hooks/use-user-role.tsx";
 import { useAtom } from "jotai";
 import { entitlementAtom } from "@/ee/entitlement/entitlement-atom";
+import { workspaceAtom } from "@/features/user/atoms/current-user-atom.ts";
 import { Feature } from "@/ee/features";
 import { useUpgradeLabel } from "@/ee/hooks/use-upgrade-label";
 import {
@@ -43,6 +46,7 @@ import AppVersion from "@/components/settings/app-version.tsx";
 import { mobileSidebarAtom } from "@/components/layouts/global/hooks/atoms/sidebar-atom.ts";
 import { useToggleSidebar } from "@/components/layouts/global/hooks/hooks/use-toggle-sidebar.ts";
 import { useSettingsNavigation } from "@/hooks/use-settings-navigation";
+import { useInstalledIntegrations } from "@/features/integration/queries/integration-query";
 
 type DataItem = {
   label: string;
@@ -51,6 +55,7 @@ type DataItem = {
   feature?: string;
   role?: "admin" | "owner";
   env?: "cloud" | "selfhosted";
+  requiresInstalledIntegration?: boolean;
 };
 
 type DataGroup = {
@@ -74,6 +79,12 @@ const groupedData: DataGroup[] = [
         path: "/settings/account/api-keys",
         feature: Feature.API_KEYS,
       },
+      {
+        label: "Connections",
+        icon: IconPlug,
+        path: "/settings/account/connections",
+        requiresInstalledIntegration: true,
+      },
     ],
   },
   {
@@ -96,8 +107,20 @@ const groupedData: DataGroup[] = [
         role: "admin",
       },
       { label: "Groups", icon: IconUsersGroup, path: "/settings/groups" },
-      { label: "Spaces", icon: IconSpaces, path: "/settings/spaces" },
+      {
+        label: "Spaces",
+        icon: IconSpaces,
+        path: "/settings/spaces",
+        role: "admin",
+      },
       { label: "Public sharing", icon: IconWorld, path: "/settings/sharing" },
+      // No feature gate: without a license the page lists read-only, with archive and delete
+      {
+        label: "Announcements",
+        icon: IconSpeakerphone,
+        path: "/settings/announcements",
+        role: "admin",
+      },
       {
         label: "Verified pages",
         icon: IconShieldCheck,
@@ -118,12 +141,17 @@ const groupedData: DataGroup[] = [
         role: "admin",
       },
       {
-        label: "Audit log",
+        label: "Integrations",
+        icon: IconPlug,
+        path: "/settings/integrations",
+        role: "admin",
+      },
+      {
+        label: "Audit logs & SIEM",
         icon: IconHistory,
         path: "/settings/audit",
         feature: Feature.AUDIT_LOGS,
         role: "owner",
-        env: "selfhosted",
       },
     ],
   },
@@ -146,6 +174,7 @@ export default function SettingsSidebar() {
   const { goBack } = useSettingsNavigation();
   const { isAdmin, isOwner } = useUserRole();
   const [entitlements] = useAtom(entitlementAtom);
+  const [workspace] = useAtom(workspaceAtom);
   const upgradeLabel = useUpgradeLabel();
   const [mobileSidebarOpened] = useAtom(mobileSidebarAtom);
   const toggleMobileSidebar = useToggleSidebar(mobileSidebarAtom);
@@ -153,6 +182,8 @@ export default function SettingsSidebar() {
   useEffect(() => {
     setActive(location.pathname);
   }, [location.pathname]);
+
+  const { data: installedIntegrations } = useInstalledIntegrations();
 
   const hasFeature = (f: string) =>
     entitlements?.features?.includes(f) ?? false;
@@ -162,11 +193,21 @@ export default function SettingsSidebar() {
     if (item.env === "selfhosted" && isCloud()) return false;
     if (item.role === "admin" && !isAdmin) return false;
     if (item.role === "owner" && !isOwner) return false;
+    if (item.requiresInstalledIntegration && !installedIntegrations?.length) {
+      return false;
+    }
     return true;
   };
 
   const isItemDisabled = (item: DataItem) => {
     if (!item.feature) return false;
+    // a lapsed license must still reach the export switch to turn it off
+    if (
+      item.path === "/settings/security" &&
+      workspace?.settings?.export?.disabled
+    ) {
+      return false;
+    }
     return !hasFeature(item.feature);
   };
 
@@ -219,7 +260,7 @@ export default function SettingsSidebar() {
             case "API management":
               prefetchHandler = prefetchApiKeyManagement;
               break;
-            case "Audit log":
+            case "Audit logs & SIEM":
               prefetchHandler = prefetchAuditLogs;
               break;
             case "Verified pages":
@@ -298,7 +339,7 @@ export default function SettingsSidebar() {
         <Text fw={500}>{t("Settings")}</Text>
       </Group>
 
-      <ScrollArea w="100%">{menuItems}</ScrollArea>
+      <ScrollArea w="100%" scrollbarSize={5}>{menuItems}</ScrollArea>
 
       {!isCloud() && <AppVersion />}
 

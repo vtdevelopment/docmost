@@ -25,13 +25,32 @@ api.interceptors.response.use(
 
     return response.data;
   },
-  (error) => {
+  async (error) => {
+    const data = error.response?.data;
+    if (data instanceof Blob && data.type.includes("json")) {
+      try {
+        error.response.data = JSON.parse(await data.text());
+      } catch {
+        // not json, keep the blob
+      }
+    }
+
     if (error.response) {
       switch (error.response.status) {
         case 401: {
           const url = new URL(error.request.responseURL)?.pathname;
           if (url === "/api/auth/collab-token") return;
           if (window.location.pathname.startsWith("/share/")) return;
+          // public docs and forms probe authed endpoints; reject without the login redirect
+          if (
+            window.location.pathname === "/docs" ||
+            window.location.pathname.startsWith("/docs/") ||
+            window.location.pathname.startsWith("/forms/")
+          ) {
+            break;
+          }
+          // the banner poll runs in the background; an idle reader stays on the page
+          if (url === "/api/announcements/visible") break;
 
           // Handle unauthorized error
           redirectToLogin();
@@ -76,13 +95,15 @@ function redirectToLogin() {
     APP_ROUTE.AUTH.MFA_CHALLENGE,
     APP_ROUTE.AUTH.MFA_SETUP_REQUIRED,
     "/invites",
+    // the oauth consent page redirects to login itself, preserving its query string
+    "/oauth/consent",
   ];
-  if (!exemptPaths.some((path) => window.location.pathname.startsWith(path))) {
-    const redirectTo = window.location.pathname;
-    if (redirectTo === APP_ROUTE.HOME) {
+  const { pathname, search, hash } = window.location;
+  if (!exemptPaths.some((path) => pathname.startsWith(path))) {
+    if (pathname === APP_ROUTE.HOME) {
       window.location.href = APP_ROUTE.AUTH.LOGIN;
     } else {
-      const params = new URLSearchParams({ redirect: redirectTo });
+      const params = new URLSearchParams({ redirect: pathname + search + hash });
       window.location.href = `${APP_ROUTE.AUTH.LOGIN}?${params.toString()}`;
     }
   }

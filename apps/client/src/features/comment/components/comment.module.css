@@ -6,6 +6,19 @@
     border: 2px solid #8d7249;
 }
 
+.deepLinkHighlight {
+    animation: comment-deep-link-flash 3s ease-out;
+}
+
+@keyframes comment-deep-link-flash {
+    0% {
+        background-color: var(--mantine-color-yellow-light);
+    }
+    100% {
+        background-color: transparent;
+    }
+}
+
 .textSelection {
     margin-top: 4px;
     border-left: 2px solid var(--mantine-color-gray-6);
@@ -51,6 +64,12 @@
     .ProseMirror p {
         margin-block-start: 0;
         margin-block-end: 0;
+    }
+
+    .ProseMirror :global(.comment-image) {
+        display: block;
+        max-width: min(250px, 100%);
+        height: auto;
     }
 
     .actions {

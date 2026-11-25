@@ -5,6 +5,12 @@ import { uploadPdfAction } from "../pdf/upload-pdf-action";
 import { createMentionAction } from "@/features/editor/components/link/internal-link-paste.ts";
 import { INTERNAL_LINK_REGEX } from "@/lib/constants.ts";
 import { Editor } from "@tiptap/core";
+import type { Node as ProseMirrorNode } from "@tiptap/pm/model";
+import { matchIntegrationLink, type UploadTarget } from "@docmost/editor-ext";
+import { integrationPasteMenuKey } from "@/features/editor/extensions/integration-paste-menu";
+import { canPlaceIntegrationCard } from "@/features/editor/components/integration-link/integration-display";
+import { queryClient } from "@/main.tsx";
+import { Integration } from "@/features/integration/types/integration.types";
 import {
   getAttachmentInfo,
   uploadFile,
@@ -22,18 +28,116 @@ const ATTACHMENT_NODE_TYPES = [
 
 const ATTACHMENT_URL_RE = /\/api\/files\/([0-9a-f-]+)\//;
 
+// copied cards and mentions paste back as nodes
+const INTEGRATION_NODE_HTML_RE = /data-type="integration(Card|Mention)"/;
+
+// Reads the cache the page editor prefetches; a cold cache pastes an ordinary link.
+function matchInstalledIntegrationLink(url: string) {
+  const installed =
+    queryClient.getQueryData<Integration[]>(["installed-integrations"]) ?? [];
+  const unfurlHosts = Object.fromEntries(
+    installed
+      .filter((integration) => integration.unfurlHosts)
+      .map((integration) => [integration.type, integration.unfurlHosts]),
+  );
+  const match = matchIntegrationLink(url, unfurlHosts);
+  return match && installed.some((i) => i.type === match.provider)
+    ? match
+    : null;
+}
+
 export const handlePaste = (
   editor: Editor,
   event: ClipboardEvent,
-  pageId: string,
+  uploadTarget: UploadTarget,
   creatorId?: string,
 ) => {
   const clipboardData = event.clipboardData.getData("text/plain");
 
-  if (INTERNAL_LINK_REGEX.test(clipboardData)) {
+  const integrationMatch = matchInstalledIntegrationLink(clipboardData.trim());
+  if (
+    integrationMatch &&
+    !INTEGRATION_NODE_HTML_RE.test(event.clipboardData.getData("text/html")) &&
+    editor.state.selection.empty &&
+    editor.state.selection.$from.parent.type.name === "paragraph" &&
+    !editor.isActive("code")
+  ) {
+    const pastedUrl = clipboardData.trim();
+    const { $from } = editor.state.selection;
+
+    if (canPlaceIntegrationCard(editor, $from.pos)) {
+      event.preventDefault();
+      editor
+        .chain()
+        .focus()
+        .setIntegrationCard({
+          url: pastedUrl,
+          provider: integrationMatch.provider,
+        })
+        // Set the meta in this transaction (BubbleMenu ignores meta-only ones) and find the node by changed range, not url.
+        .command(({ tr }) => {
+          let start: number | null = null;
+          let end: number | null = null;
+          tr.mapping.maps.forEach((map, index) => {
+            const rest = tr.mapping.slice(index + 1);
+            map.forEach((_oldStart, _oldEnd, newStart, newEnd) => {
+              const mappedStart = rest.map(newStart, -1);
+              const mappedEnd = rest.map(newEnd, 1);
+              start =
+                start === null ? mappedStart : Math.min(start, mappedStart);
+              end = end === null ? mappedEnd : Math.max(end, mappedEnd);
+            });
+          });
+          if (start === null || end === null) return true;
+
+          let pastedPos: number | null = null;
+          tr.doc.nodesBetween(
+            start,
+            Math.min(end, tr.doc.content.size),
+            (node, pos) => {
+              if (node.type.name === "integrationCard") {
+                pastedPos = pos;
+              }
+            },
+          );
+          if (pastedPos !== null) {
+            tr.setMeta(integrationPasteMenuKey, {
+              pos: pastedPos,
+              joinBefore: $from.parentOffset > 0,
+              joinAfter: $from.parentOffset < $from.parent.content.size,
+            });
+          }
+          return true;
+        })
+        .run();
+      return true;
+    }
+
+    // Containers such as footnotes only hold paragraphs, but a mention still fits.
+    const mentionType = editor.schema.nodes.integrationMention;
+    if (
+      mentionType &&
+      $from.parent.canReplaceWith($from.index(), $from.index(), mentionType)
+    ) {
+      event.preventDefault();
+      editor
+        .chain()
+        .focus()
+        .setIntegrationMention({
+          url: pastedUrl,
+          provider: integrationMatch.provider,
+        })
+        .run();
+      return true;
+    }
+  }
+
+  // A query, such as a base's ?view=, still links to the same page.
+  const pageLink = clipboardData.replace(/\?[^#]*/, "");
+  if (INTERNAL_LINK_REGEX.test(pageLink)) {
     // we have to do this validation here to allow the default link extension to takeover if needs be
     event.preventDefault();
-    const url = clipboardData.trim();
+    const url = pageLink.trim();
     const { from: pos, empty } = editor.state.selection;
     const match = INTERNAL_LINK_REGEX.exec(url);
 
@@ -64,18 +168,18 @@ export const handlePaste = (
     event.preventDefault();
     for (const file of event.clipboardData.files) {
       const pos = editor.state.selection.from;
-      uploadImageAction(file, editor, pos, pageId);
-      uploadVideoAction(file, editor, pos, pageId);
-      uploadPdfAction(file, editor, pos, pageId);
-      uploadAttachmentAction(file, editor, pos, pageId);
+      uploadImageAction(file, editor, pos, uploadTarget);
+      uploadVideoAction(file, editor, pos, uploadTarget);
+      uploadPdfAction(file, editor, pos, uploadTarget);
+      uploadAttachmentAction(file, editor, pos, uploadTarget);
     }
     return true;
   }
 
   if (htmlData && ATTACHMENT_URL_RE.test(htmlData)) {
-    const pasteFrom = editor.state.selection.from;
+    const docBeforePaste = editor.state.doc;
     setTimeout(() => {
-      reuploadPastedAttachments(editor, pageId, pasteFrom);
+      reuploadPastedAttachments(editor, uploadTarget, docBeforePaste);
     }, 0);
   }
 
@@ -84,10 +188,17 @@ export const handlePaste = (
 
 async function reuploadPastedAttachments(
   editor: Editor,
-  pageId: string,
-  pasteFrom: number,
+  uploadTarget: UploadTarget,
+  docBeforePaste: ProseMirrorNode,
 ) {
-  const pasteEnd = editor.state.selection.from;
+  const doc = editor.state.doc;
+  const pasteFrom = docBeforePaste.content.findDiffStart(doc.content);
+  if (pasteFrom === null) return;
+  const diffEnd = docBeforePaste.content.findDiffEnd(doc.content);
+  const pasteEnd = Math.max(
+    diffEnd?.b ?? pasteFrom,
+    pasteFrom + doc.content.size - docBeforePaste.content.size,
+  );
   if (pasteEnd <= pasteFrom) return;
 
   type PastedNode = {
@@ -128,21 +239,30 @@ async function reuploadPastedAttachments(
 
   if (pastedNodes.length === 0) return;
 
-  const attachmentPageMap = new Map<string, string | null>();
+  const attachmentOwnerMap = new Map<
+    string,
+    { pageId: string | null; templateId: string | null } | null
+  >();
   await Promise.all(
     [...seenAttachmentIds].map(async (id) => {
       try {
         const info = await getAttachmentInfo(id);
-        attachmentPageMap.set(id, info.pageId);
+        attachmentOwnerMap.set(id, {
+          pageId: info.pageId,
+          templateId: info.templateId ?? null,
+        });
       } catch {
-        attachmentPageMap.set(id, null);
+        attachmentOwnerMap.set(id, null);
       }
     }),
   );
 
   const nodesToReupload = pastedNodes.filter((n) => {
-    const ownerPageId = attachmentPageMap.get(n.attachmentId);
-    return ownerPageId !== null && ownerPageId !== pageId;
+    const owner = attachmentOwnerMap.get(n.attachmentId);
+    if (!owner) return false;
+    return "pageId" in uploadTarget
+      ? owner.pageId !== uploadTarget.pageId
+      : owner.templateId !== uploadTarget.templateId;
   });
 
   if (nodesToReupload.length === 0) return;
@@ -169,7 +289,7 @@ async function reuploadPastedAttachments(
         if (!response.ok) return;
         const blob = await response.blob();
         const file = new File([blob], node.fileName, { type: blob.type });
-        const newAttachment = await uploadFile(file, pageId);
+        const newAttachment = await uploadFile(file, uploadTarget);
         reuploadResults.set(node.attachmentId, {
           id: newAttachment.id,
           fileName: newAttachment.fileName,
@@ -222,7 +342,7 @@ export const handleFileDrop = (
   editor: Editor,
   event: DragEvent,
   moved: boolean,
-  pageId: string,
+  uploadTarget: UploadTarget,
 ) => {
   if (!moved && event.dataTransfer?.files.length) {
     event.preventDefault();
@@ -233,10 +353,10 @@ export const handleFileDrop = (
         top: event.clientY,
       });
 
-      uploadImageAction(file, editor, coordinates?.pos ?? 0 - 1, pageId);
-      uploadVideoAction(file, editor, coordinates?.pos ?? 0 - 1, pageId);
-      uploadPdfAction(file, editor, coordinates?.pos ?? 0 - 1, pageId);
-      uploadAttachmentAction(file, editor, coordinates?.pos ?? 0 - 1, pageId);
+      uploadImageAction(file, editor, coordinates?.pos ?? 0 - 1, uploadTarget);
+      uploadVideoAction(file, editor, coordinates?.pos ?? 0 - 1, uploadTarget);
+      uploadPdfAction(file, editor, coordinates?.pos ?? 0 - 1, uploadTarget);
+      uploadAttachmentAction(file, editor, coordinates?.pos ?? 0 - 1, uploadTarget);
     }
     return true;
   }

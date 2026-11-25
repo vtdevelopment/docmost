@@ -16,6 +16,10 @@ export default defineConfig(({ mode }) => {
     BILLING_TRIAL_DAYS,
     POSTHOG_HOST,
     POSTHOG_KEY,
+    AI_VECTOR_DRIVER,
+    BETA_PUBLIC_SPACES,
+    BETA_BASE_FORMS,
+    UNSPLASH_ACCESS_KEY,
   } = loadEnv(mode, envPath, "");
 
   return {
@@ -31,6 +35,10 @@ export default defineConfig(({ mode }) => {
         BILLING_TRIAL_DAYS,
         POSTHOG_HOST,
         POSTHOG_KEY,
+        AI_VECTOR_DRIVER,
+        BETA_PUBLIC_SPACES,
+        BETA_BASE_FORMS,
+        UNSPLASH_ENABLED: UNSPLASH_ACCESS_KEY?.trim() ? "true" : undefined,
       },
       APP_VERSION: JSON.stringify(process.env.npm_package_version),
     },
@@ -42,7 +50,7 @@ export default defineConfig(({ mode }) => {
             groups: [
               {
                 name: "vendor-mantine",
-                test: /[\\/]node_modules[\\/]@mantine[\\/]/,
+                test: /[\\/]node_modules[\\/]@mantine[\\/](?!schedule[\\/])/,
               },
             ],
           },
@@ -53,6 +61,10 @@ export default defineConfig(({ mode }) => {
       alias: {
         "@": "/src",
       },
+    },
+    // the dep scanner skips worker entries, so their deps would trigger a full reload on first use
+    optimizeDeps: {
+      include: ["papaparse"],
     },
     server: {
       proxy: {

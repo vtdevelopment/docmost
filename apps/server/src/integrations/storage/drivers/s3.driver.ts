@@ -15,7 +15,7 @@ import { getMimeType } from '../../../common/helpers';
 import { Upload } from '@aws-sdk/lib-storage';
 import { Logger } from '@nestjs/common';
 
-const S3_MAX_SOCKETS = 200;
+const S3_MAX_SOCKETS = parseInt(process.env.AWS_S3_MAX_SOCKETS) || 200;
 
 export class S3Driver implements StorageDriver {
   private readonly s3Client: S3Client;
@@ -95,10 +95,15 @@ export class S3Driver implements StorageDriver {
   async copy(fromFilePath: string, toFilePath: string): Promise<void> {
     try {
       if (await this.exists(fromFilePath)) {
+        // CopySource must be URL-encoded (non-ASCII file names, spaces, "+").
+        const encodedPath = fromFilePath
+          .split('/')
+          .map(encodeURIComponent)
+          .join('/');
         await this.s3Client.send(
           new CopyObjectCommand({
             Bucket: this.config.bucket,
-            CopySource: `${this.config.bucket}/${fromFilePath}`,
+            CopySource: `${this.config.bucket}/${encodedPath}`,
             Key: toFilePath,
           }),
         );

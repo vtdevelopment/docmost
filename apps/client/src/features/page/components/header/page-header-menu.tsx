@@ -11,13 +11,16 @@ import {
   IconList,
   IconMarkdown,
   IconMessage,
+  IconPaperclip,
+  IconPresentation,
   IconPrinter,
   IconStar,
   IconStarFilled,
   IconTrash,
   IconWifiOff,
 } from "@tabler/icons-react";
-import React, { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import type { Content } from "@tiptap/react";
 import { useAsideTriggerProps } from "@/hooks/use-toggle-aside.tsx";
 import { useAtom, useAtomValue } from "jotai";
 import { historyAtoms } from "@/features/page-history/atoms/history-atoms.ts";
@@ -34,14 +37,17 @@ import { useDeletePageModal } from "@/features/page/hooks/use-delete-page-modal.
 import { PageWidthToggle } from "@/features/user/components/page-width-pref.tsx";
 import { Trans, useTranslation } from "react-i18next";
 import ExportModal from "@/components/common/export-modal";
-import { htmlToMarkdown } from "@docmost/editor-ext";
+import { getPageHTML, htmlToMarkdown } from "@docmost/editor-ext";
 import {
   pageEditorAtom,
   yjsConnectionStatusAtom,
+  yjsSyncedAtom,
 } from "@/features/editor/atoms/editor-atoms.ts";
 import { formattedDate } from "@/lib/time.ts";
 import { PageEditModeToggle } from "@/features/user/components/page-state-pref.tsx";
 import MovePageModal from "@/features/page/components/move-page-modal.tsx";
+import PageAttachmentsModal from "@/features/attachments/components/page-attachments-modal.tsx";
+import PresentationModal from "@/features/editor/components/presentation/presentation-modal.tsx";
 import { useTimeAgo } from "@/hooks/use-time-ago.tsx";
 import { PageShareModal } from "@/ee/page-permission";
 import {
@@ -58,6 +64,8 @@ import {
   useWatchPageMutation,
   useUnwatchPageMutation,
 } from "@/features/page/queries/watcher-query";
+import { useExportDisabled } from "@/ee/security/hooks/use-export-disabled.ts";
+import { usePrintBlockReason } from "@/ee/security/hooks/use-disable-print.ts";
 
 interface PageHeaderMenuProps {
   readOnly?: boolean;
@@ -76,10 +84,17 @@ export default function PageHeaderMenu({ readOnly }: PageHeaderMenuProps) {
     [
       [
         "mod+F",
-        () => {
+        (keyboardEvent) => {
+          // keepMounted modals (page import) stay in the DOM while closed
+          const modalOpen = Array.from(
+            document.querySelectorAll('[aria-modal="true"]'),
+          ).some((modal) => modal.getClientRects().length > 0);
+          if (modalOpen) return;
+          keyboardEvent.preventDefault();
           const event = new CustomEvent("openFindDialogFromEditor", {});
           document.dispatchEvent(event);
         },
+        { preventDefault: false },
       ],
       [
         "Escape",
@@ -101,7 +116,9 @@ export default function PageHeaderMenu({ readOnly }: PageHeaderMenuProps) {
     <>
       <ConnectionWarning />
 
-      {!readOnly && !page?.isBase && <PageEditModeToggle size="xs" />}
+      {!readOnly && !page?.isBase && (
+        <PageEditModeToggle size="xs" pageId={page?.id} />
+      )}
 
       <PageShareModal readOnly={readOnly} />
 
@@ -145,6 +162,11 @@ function PageActionMenu({ readOnly }: PageActionMenuProps) {
   const { data: page, isLoading } = usePageQuery({
     pageId: extractPageSlugId(pageSlug),
   });
+  const { exportDisabled, exportDisabledLabel } = useExportDisabled(
+    page?.space?.slug,
+  );
+  // also set by bases and synced blocks embedded from other spaces
+  const printBlockReason = usePrintBlockReason();
   const { openDeleteModal } = useDeletePageModal();
   const { handleDelete } = useTreeMutation(page?.spaceId ?? "");
   const [exportOpened, { open: openExportModal, close: closeExportModal }] =
@@ -156,6 +178,14 @@ function PageActionMenu({ readOnly }: PageActionMenuProps) {
   const [
     verificationOpened,
     { open: openVerificationModal, close: closeVerificationModal },
+  ] = useDisclosure(false);
+  const [
+    attachmentsOpened,
+    { open: openAttachmentsModal, close: closeAttachmentsModal },
+  ] = useDisclosure(false);
+  const [
+    presentationOpened,
+    { open: openPresentationModal, close: closePresentationModal },
   ] = useDisclosure(false);
   const [pageEditor] = useAtom(pageEditorAtom);
   const pageUpdatedAt = useTimeAgo(page?.updatedAt);
@@ -176,8 +206,8 @@ function PageActionMenu({ readOnly }: PageActionMenuProps) {
   };
 
   const handleCopyAsMarkdown = () => {
-    if (!pageEditor) return;
-    const html = pageEditor.getHTML();
+    if (!pageEditor || pageEditor.isDestroyed) return;
+    const html = getPageHTML(pageEditor);
     const markdown = htmlToMarkdown(html);
     const title = page?.title ? `# ${page.title}\n\n` : "";
     clipboard.copy(`${title}${markdown}`);
@@ -196,6 +226,18 @@ function PageActionMenu({ readOnly }: PageActionMenuProps) {
 
   const handleDeletePage = () => {
     openDeleteModal({ onConfirm: () => handleDelete(page.id) });
+  };
+
+  const yjsSynced = useAtomValue(yjsSyncedAtom);
+  const [presentationContent, setPresentationContent] = useState<Content>(null);
+
+  const handleOpenPresentation = () => {
+    const liveContent =
+      yjsSynced && pageEditor && !pageEditor.isDestroyed
+        ? pageEditor.getJSON()
+        : null;
+    setPresentationContent(liveContent ?? page?.content ?? null);
+    openPresentationModal();
   };
 
   const handleToggleFavorite = () => {
@@ -237,12 +279,21 @@ function PageActionMenu({ readOnly }: PageActionMenuProps) {
           </Menu.Item>
 
           {!page?.isBase && (
-            <Menu.Item
-              leftSection={<IconMarkdown size={16} />}
-              onClick={handleCopyAsMarkdown}
+            <Tooltip
+              label={exportDisabledLabel}
+              disabled={!exportDisabled}
+              position="left"
+              withArrow
             >
-              {t("Copy as Markdown")}
-            </Menu.Item>
+              <Menu.Item
+                leftSection={<IconMarkdown size={16} />}
+                onClick={exportDisabled ? undefined : handleCopyAsMarkdown}
+                data-disabled={exportDisabled || undefined}
+                aria-disabled={exportDisabled || undefined}
+              >
+                {t("Copy as Markdown")}
+              </Menu.Item>
+            </Tooltip>
           )}
 
           <Menu.Item
@@ -293,6 +344,24 @@ function PageActionMenu({ readOnly }: PageActionMenuProps) {
             </Menu.Item>
           )}
 
+          {!page?.isBase && (
+            <Menu.Item
+              leftSection={<IconPaperclip size={16} />}
+              onClick={openAttachmentsModal}
+            >
+              {t("Attachments")}
+            </Menu.Item>
+          )}
+
+          {!page?.isBase && (
+            <Menu.Item
+              leftSection={<IconPresentation size={16} />}
+              onClick={handleOpenPresentation}
+            >
+              {t("Presentation mode")}
+            </Menu.Item>
+          )}
+
           {!readOnly && !page?.isBase && (
             <PageVerificationMenuItem
               pageId={page?.id}
@@ -311,19 +380,37 @@ function PageActionMenu({ readOnly }: PageActionMenuProps) {
             </Menu.Item>
           )}
 
-          <Menu.Item
-            leftSection={<IconFileExport size={16} />}
-            onClick={openExportModal}
+          <Tooltip
+            label={exportDisabledLabel}
+            disabled={!exportDisabled}
+            position="left"
+            withArrow
           >
-            {t("Export")}
-          </Menu.Item>
+            <Menu.Item
+              leftSection={<IconFileExport size={16} />}
+              onClick={exportDisabled ? undefined : openExportModal}
+              data-disabled={exportDisabled || undefined}
+              aria-disabled={exportDisabled || undefined}
+            >
+              {t("Export")}
+            </Menu.Item>
+          </Tooltip>
 
-          <Menu.Item
-            leftSection={<IconPrinter size={16} />}
-            onClick={handlePrint}
+          <Tooltip
+            label={printBlockReason}
+            disabled={!printBlockReason}
+            position="left"
+            withArrow
           >
-            {t("Print PDF")}
-          </Menu.Item>
+            <Menu.Item
+              leftSection={<IconPrinter size={16} />}
+              onClick={printBlockReason ? undefined : handlePrint}
+              data-disabled={printBlockReason ? true : undefined}
+              aria-disabled={printBlockReason ? true : undefined}
+            >
+              {t("Print PDF")}
+            </Menu.Item>
+          </Tooltip>
 
           {!readOnly && (
             <>
@@ -343,10 +430,14 @@ function PageActionMenu({ readOnly }: PageActionMenuProps) {
           <>
             <Group px="sm" wrap="nowrap" style={{ cursor: "pointer" }}>
               <Tooltip
-                label={t("Edited by {{name}} {{time}}", {
-                  name: page.lastUpdatedBy.name,
-                  time: pageUpdatedAt,
-                })}
+                label={
+                  page.lastUpdatedBy
+                    ? t("Edited by {{name}} {{time}}", {
+                        name: page.lastUpdatedBy.name,
+                        time: pageUpdatedAt,
+                      })
+                    : t("Updated {{date}}", { date: pageUpdatedAt })
+                }
                 position="left-start"
               >
                 <div style={{ width: 210 }}>
@@ -394,6 +485,21 @@ function PageActionMenu({ readOnly }: PageActionMenuProps) {
         pageId={page.id}
         opened={verificationOpened}
         onClose={closeVerificationModal}
+      />
+
+      <PageAttachmentsModal
+        pageId={page.id}
+        readOnly={readOnly}
+        open={attachmentsOpened}
+        onClose={closeAttachmentsModal}
+      />
+
+      <PresentationModal
+        pageId={page.id}
+        title={page.title}
+        content={presentationContent}
+        opened={presentationOpened}
+        onClose={closePresentationModal}
       />
     </>
   );

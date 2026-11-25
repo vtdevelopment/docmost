@@ -24,6 +24,7 @@ import {
   RevokeInviteDto,
 } from '../dto/invitation.dto';
 import { JwtAuthGuard } from '../../../common/guards/jwt-auth.guard';
+import { OAuthScope } from '../../../common/decorators/oauth-scope.decorator';
 import { User, Workspace } from '@docmost/db/types/entity.types';
 import WorkspaceAbilityFactory from '../../casl/abilities/workspace-ability.factory';
 import {
@@ -35,7 +36,10 @@ import { EnvironmentService } from '../../../integrations/environment/environmen
 import { LicenseCheckService } from '../../../integrations/environment/license-check.service';
 import { CheckHostnameDto } from '../dto/check-hostname.dto';
 import { RemoveWorkspaceUserDto } from '../dto/remove-workspace-user.dto';
+import { ListWorkspaceUsersDto } from '../dto/list-workspace-users.dto';
+import { resolveWorkspaceUserListStatus } from '../workspace.util';
 import { WorkspaceRepo } from '@docmost/db/repos/workspace/workspace.repo';
+import { ApiKeyScope } from '../../../common/decorators/api-key-scope.decorator';
 
 @UseGuards(JwtAuthGuard)
 @Controller('workspace')
@@ -58,10 +62,12 @@ export class WorkspaceController {
 
   @HttpCode(HttpStatus.OK)
   @Post('/info')
+  @OAuthScope('read')
   async getWorkspace(@AuthWorkspace() workspace: Workspace) {
     return this.workspaceService.getWorkspaceInfo(workspace.id);
   }
 
+  @ApiKeyScope('read')
   @HttpCode(HttpStatus.OK)
   @Post('entitlements')
   async getEntitlements(@AuthWorkspace() workspace: Workspace) {
@@ -113,9 +119,10 @@ export class WorkspaceController {
 
   @HttpCode(HttpStatus.OK)
   @Post('members')
+  @OAuthScope('read')
   async getWorkspaceMembers(
     @Body()
-    pagination: PaginationOptions,
+    dto: ListWorkspaceUsersDto,
     @AuthUser() user: User,
     @AuthWorkspace() workspace: Workspace,
   ) {
@@ -124,7 +131,15 @@ export class WorkspaceController {
       throw new ForbiddenException();
     }
 
-    return this.workspaceService.getWorkspaceUsers(workspace.id, pagination);
+    const canManageMembers = ability.can(
+      WorkspaceCaslAction.Manage,
+      WorkspaceCaslSubject.Member,
+    );
+
+    return this.workspaceService.getWorkspaceUsers(workspace.id, dto, {
+      status: resolveWorkspaceUserListStatus(dto.status, canManageMembers),
+      adminView: canManageMembers,
+    });
   }
 
   @HttpCode(HttpStatus.OK)
@@ -196,6 +211,7 @@ export class WorkspaceController {
     );
   }
 
+  @ApiKeyScope('read')
   @HttpCode(HttpStatus.OK)
   @Post('invites')
   async getInvitations(
@@ -310,6 +326,7 @@ export class WorkspaceController {
 
     res.setCookie('authToken', result.authToken, {
       httpOnly: true,
+      sameSite: 'lax',
       path: '/',
       expires: this.environmentService.getCookieExpiresIn(),
       secure: this.environmentService.isHttps(),

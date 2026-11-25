@@ -10,6 +10,7 @@ import { KyselyDB } from '@docmost/db/types/kysely.types';
 import { nanoIdGen } from '../../common/helpers';
 import { PageRepo } from '@docmost/db/repos/page/page.repo';
 import { TokenService } from '../auth/services/token.service';
+import { withoutTemplatePlaceholders } from '@docmost/editor-ext';
 import { jsonToNode } from '../../collaboration/collaboration.util';
 import {
   getAttachmentIds,
@@ -18,14 +19,17 @@ import {
   removeMarkTypeFromDoc,
 } from '../../common/helpers/prosemirror/utils';
 import { Node } from '@tiptap/pm/model';
+import { Transform } from '@tiptap/pm/transform';
 import { ShareRepo } from '@docmost/db/repos/share/share.repo';
 import { PagePermissionRepo } from '@docmost/db/repos/page/page-permission.repo';
-import { updateAttachmentAttr } from './share.util';
+import { updateAttachmentAttr, updateAttachmentUrl } from './share.util';
 import { Page } from '@docmost/db/types/entity.types';
+import { getCoverAttachmentId } from '../page/page-cover.utils';
 import { validate as isValidUUID } from 'uuid';
 import { sql } from 'kysely';
 import { TransclusionService } from '../page/transclusion/transclusion.service';
 import { TransclusionLookup } from '../page/transclusion/transclusion.types';
+import { PaginationOptions } from '@docmost/db/pagination/pagination-options';
 
 @Injectable()
 export class ShareService {
@@ -40,14 +44,29 @@ export class ShareService {
     private readonly transclusionService: TransclusionService,
   ) {}
 
+  async getShares(userId: string, pagination: PaginationOptions) {
+    const result = await this.shareRepo.getShares(userId, pagination);
+    const accessiblePageIds = new Set(
+      await this.pagePermissionRepo.filterAccessiblePageIds({
+        pageIds: result.items.map((share) => share.pageId),
+        userId,
+      }),
+    );
+    result.items = result.items.filter((share) =>
+      accessiblePageIds.has(share.pageId),
+    );
+    return result;
+  }
+
   async getShareTree(shareId: string, workspaceId: string) {
     const share = await this.shareRepo.findById(shareId);
     if (!share || share.workspaceId !== workspaceId) {
       throw new NotFoundException('Share not found');
     }
 
-    const isRestricted =
-      await this.pagePermissionRepo.hasRestrictedAncestor(share.pageId);
+    const isRestricted = await this.pagePermissionRepo.hasRestrictedAncestor(
+      share.pageId,
+    );
     if (isRestricted) {
       throw new NotFoundException('Share not found');
     }
@@ -109,30 +128,44 @@ export class ShareService {
     }
   }
 
-  async getSharedPage(dto: ShareInfoDto, workspaceId: string) {
+  async getSharedPage(
+    dto: ShareInfoDto,
+    workspaceId: string,
+    opts?: { includeContent?: boolean },
+  ) {
+    //TODO: we should resolve the page from the share id
+    if (!dto.pageId) throw new NotFoundException('Shared page not found');
+
     const share = await this.getShareForPage(dto.pageId, workspaceId);
 
     if (!share) {
       throw new NotFoundException('Shared page not found');
     }
 
-    const page = await this.pageRepo.findById(dto.pageId, {
-      includeContent: true,
-      includeCreator: true,
-    });
+    const includeContent = opts?.includeContent !== false;
+    const page = includeContent
+      ? await this.pageRepo.findById(dto.pageId, {
+          includeContent: true,
+          includeCreator: true,
+        })
+      : await this.pageRepo.findById(dto.pageId);
 
     if (!page || page.deletedAt) {
       throw new NotFoundException('Shared page not found');
     }
 
     // Block access to restricted pages
-    const isRestricted =
-      await this.pagePermissionRepo.hasRestrictedAncestor(page.id);
+    const isRestricted = await this.pagePermissionRepo.hasRestrictedAncestor(
+      page.id,
+    );
     if (isRestricted) {
       throw new NotFoundException('Shared page not found');
     }
 
-    page.content = await this.updatePublicAttachments(page);
+    if (includeContent) {
+      page.content = await this.updatePublicAttachments(page);
+      page.coverPhoto = await this.updatePublicCoverPhoto(page);
+    }
 
     return { page, share };
   }
@@ -150,6 +183,7 @@ export class ShareService {
             'pages.title',
             'pages.icon',
             'pages.parentPageId',
+            'pages.spaceId as pageSpaceId',
             sql`0`.as('level'),
             'shares.id as shareId',
             'shares.key as shareKey',
@@ -174,6 +208,7 @@ export class ShareService {
                   'p.title',
                   'p.icon',
                   'p.parentPageId',
+                  'p.spaceId as pageSpaceId',
                   sql`ph.level + 1`.as('level'),
                   's.id as shareId',
                   's.key as shareKey',
@@ -185,6 +220,7 @@ export class ShareService {
                   's.createdAt',
                 ])
                 .where('p.deletedAt', 'is', null)
+                .whereRef('p.spaceId', '=', 'ph.pageSpaceId')
                 .where(sql`ph.share_id`, 'is', null) // stop if share found
                 .where(sql`ph.level`, '<', sql`25`), // prevent loop
           ),
@@ -360,35 +396,9 @@ export class ShareService {
       workspaceId,
     );
 
-    // Sanitize each item's content for public delivery
-    // generate per-attachment tokens scoped to the source page
-    // and strip comment marks.
-    const tokenized = await Promise.all(
-      items.map(async (item) => {
-        if ('status' in item) return item;
-        const doc = await this.prepareContentForShare(
-          item.content,
-          item.sourcePageId,
-          workspaceId,
-        );
-        return { ...item, content: doc?.toJSON() ?? item.content };
-      }),
-    );
-
-    // Collapse `not_found` to `no_access` for share viewers so the response
-    // can't be used to tell "page is shared but transclusion id doesn't
-    // match" from "page isn't shared at all".
-    const sanitized = tokenized.map((item) =>
-      'status' in item && item.status === 'not_found'
-        ? {
-            sourcePageId: item.sourcePageId,
-            transclusionId: item.transclusionId,
-            status: 'no_access' as const,
-          }
-        : item,
-    );
-
-    return { items: sanitized };
+    return {
+      items: await this.sanitizeTransclusionItemsForPublic(items, workspaceId),
+    };
   }
 
   async isSharingAllowed(
@@ -422,12 +432,56 @@ export class ShareService {
       page.id,
       page.workspaceId,
     );
-    return doc?.toJSON() ?? page.content;
+    return doc.toJSON();
+  }
+
+  async updatePublicCoverPhoto(page: Page): Promise<string | null> {
+    const attachmentId = getCoverAttachmentId(page.coverPhoto);
+    if (!attachmentId) return page.coverPhoto;
+
+    const token = await this.tokenService.generateAttachmentToken({
+      attachmentId,
+      pageId: page.id,
+      workspaceId: page.workspaceId,
+    });
+    return updateAttachmentUrl(page.coverPhoto, token);
+  }
+
+  /**
+   * Sanitization tail shared by every public transclusion surface: tokenize
+   * each content item against its source page, then hide lookup misses.
+   */
+  async sanitizeTransclusionItemsForPublic(
+    items: TransclusionLookup[],
+    workspaceId: string,
+  ): Promise<TransclusionLookup[]> {
+    const tokenized = await Promise.all(
+      items.map(async (item) => {
+        if ('status' in item) return item;
+        const doc = await this.prepareContentForShare(
+          item.content,
+          item.sourcePageId,
+          workspaceId,
+        );
+        return { ...item, content: doc.toJSON() };
+      }),
+    );
+
+    // Collapse not_found to no_access so hidden sources are indistinguishable from missing ids.
+    return tokenized.map((item) =>
+      'status' in item && item.status === 'not_found'
+        ? {
+            sourcePageId: item.sourcePageId,
+            transclusionId: item.transclusionId,
+            status: 'no_access' as const,
+          }
+        : item,
+    );
   }
 
   /**
    * Prepare a ProseMirror JSON doc for delivery to a public share viewer.
-   * Performs the two transforms required by the share threat model:
+   * Prepares attachments and removes private editor metadata.
    *
    * 1. Mint a per-attachment public token scoped to `attachmentOwnerPageId`
    *    and rewrite each attachment node's `src`/`url` to the public form
@@ -437,9 +491,8 @@ export class ShareService {
    *    content, the source page for transcluded source-block content
    *    (attachments in a sync block were uploaded onto the source page).
    *
-   * 2. Strip `comment` marks. Comments are internal-team metadata and must
-   *    not leak structure (existence, location, count, resolved state, or
-   *    comment ids) to public viewers.
+   * 2. Remove private page queries, template instructions and `comment` marks from the
+   *    surrounding page content.
    *
    * Both share-content paths — the host page (`updatePublicAttachments`) and
    * the share-scoped transclusion lookup (`lookupTransclusionForShare`) —
@@ -450,7 +503,7 @@ export class ShareService {
     content: unknown,
     attachmentOwnerPageId: string,
     workspaceId: string,
-  ): Promise<Node | null> {
+  ): Promise<Node> {
     const pmJson = getProsemirrorContent(content);
     const attachmentIds = getAttachmentIds(pmJson);
 
@@ -467,7 +520,16 @@ export class ShareService {
     );
 
     const doc = jsonToNode(pmJson);
-    doc?.descendants((node: Node) => {
+    const tr = new Transform(doc);
+    doc.descendants((node: Node, pos: number) => {
+      if (
+        node.type.name === 'recentlyUpdated' ||
+        node.type.name === 'itemsByLabel'
+      ) {
+        const from = tr.mapping.map(pos);
+        tr.delete(from, from + node.nodeSize);
+        return false;
+      }
       if (!isAttachmentNode(node.type.name)) return;
       const token = tokenMap.get(node.attrs.attachmentId);
       if (!token) return;
@@ -475,6 +537,7 @@ export class ShareService {
       updateAttachmentAttr(node, 'url', token);
     });
 
-    return doc ? removeMarkTypeFromDoc(doc, 'comment') : null;
+    const publicDoc = tr.doc.copy(withoutTemplatePlaceholders(tr.doc.content));
+    return removeMarkTypeFromDoc(publicDoc, 'comment');
   }
 }

@@ -12,12 +12,14 @@ export enum EventName {
   SPACE_UPDATED = 'space.updated',
   SPACE_DELETED = 'space.deleted',
 
+  USER_PASSWORD_RESET = 'user.password.reset',
+
   WORKSPACE_CREATED = 'workspace.created',
   WORKSPACE_UPDATED = 'workspace.updated',
   WORKSPACE_DELETED = 'workspace.deleted',
+  NOTIFICATION_CREATED = 'notification.created',
 
   BASE_CREATED = 'base.created',
-  BASE_UPDATED = 'base.updated',
   BASE_DELETED = 'base.deleted',
 
   BASE_ROW_CREATED = 'base.row.created',
@@ -35,9 +37,12 @@ export enum EventName {
   BASE_VIEW_CREATED = 'base.view.created',
   BASE_VIEW_UPDATED = 'base.view.updated',
   BASE_VIEW_DELETED = 'base.view.deleted',
+  BASE_VIEW_SHARE_UPDATED = 'base.view.share.updated',
 
   BASE_SCHEMA_BUMPED = 'base.schema.bumped',
   BASE_ROWS_UPDATED = 'base.rows.updated',
   BASE_FORMULA_RECOMPUTE_STARTED = 'base.formula.recompute.started',
   BASE_FORMULA_RECOMPUTE_COMPLETED = 'base.formula.recompute.completed',
+  BASE_IMPORT_PROGRESS = 'base.import.progress',
+  BASE_IMPORT_COMPLETED = 'base.import.completed',
 }

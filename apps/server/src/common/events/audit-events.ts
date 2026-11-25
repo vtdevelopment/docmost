@@ -14,6 +14,7 @@ export const AuditEvent = {
   USER_ROLE_CHANGED: 'user.role_changed',
   USER_PASSWORD_CHANGED: 'user.password_changed',
   USER_PASSWORD_RESET: 'user.password_reset',
+  USER_PASSWORD_RESET_REQUESTED: 'user.password_reset_requested',
   USER_UPDATED: 'user.updated',
   USER_DEACTIVATED: 'user.deactivated',
   USER_ACTIVATED: 'user.activated',
@@ -22,6 +23,17 @@ export const AuditEvent = {
   API_KEY_CREATED: 'api_key.created',
   API_KEY_UPDATED: 'api_key.updated',
   API_KEY_DELETED: 'api_key.deleted',
+
+  // OAuth
+  OAUTH_CLIENT_REGISTERED: 'oauth_client.registered',
+  OAUTH_GRANT_CREATED: 'oauth_grant.created',
+  OAUTH_GRANT_REVOKED: 'oauth_grant.revoked',
+
+  // Integrations
+  INTEGRATION_INSTALLED: 'integration.installed',
+  INTEGRATION_UNINSTALLED: 'integration.uninstalled',
+  INTEGRATION_CONNECTED: 'integration.connected',
+  INTEGRATION_DISCONNECTED: 'integration.disconnected',
 
   // SCIM Tokens
   SCIM_TOKEN_CREATED: 'scim_token.created',
@@ -32,6 +44,8 @@ export const AuditEvent = {
   SPACE_CREATED: 'space.created',
   SPACE_UPDATED: 'space.updated',
   SPACE_DELETED: 'space.deleted',
+  SPACE_ARCHIVED: 'space.archived',
+  SPACE_UNARCHIVED: 'space.unarchived',
   SPACE_MEMBER_ADDED: 'space.member_added',
   SPACE_MEMBER_REMOVED: 'space.member_removed',
   SPACE_MEMBER_ROLE_CHANGED: 'space.member_role_changed',
@@ -64,14 +78,18 @@ export const AuditEvent = {
   PAGE_RESTRICTION_REMOVED: 'page.restriction_removed',
   PAGE_PERMISSION_ADDED: 'page.permission_added',
   PAGE_PERMISSION_REMOVED: 'page.permission_removed',
+  PAGE_PERMISSION_ROLE_CHANGED: 'page.permission_role_changed',
   // Page verification
   PAGE_VERIFICATION_CREATED: 'page.verification_created',
   PAGE_VERIFICATION_UPDATED: 'page.verification_updated',
   PAGE_VERIFICATION_REMOVED: 'page.verification_removed',
+  PAGE_VERIFIER_ADDED: 'page.verifier_added',
+  PAGE_VERIFIER_REMOVED: 'page.verifier_removed',
   PAGE_VERIFIED: 'page.verified',
   PAGE_APPROVAL_REQUESTED: 'page.approval_requested',
   PAGE_APPROVAL_REJECTED: 'page.approval_rejected',
   PAGE_MARKED_OBSOLETE: 'page.marked_obsolete',
+  PAGE_VERIFICATION_INVALIDATED: 'page.verification_invalidated',
 
   // Share
   SHARE_CREATED: 'share.created',
@@ -98,7 +116,29 @@ export const AuditEvent = {
 
   // Attachment
   ATTACHMENT_UPLOADED: 'attachment.uploaded',
-  // ATTACHMENT_DELETED: 'attachment.deleted',
+  ATTACHMENT_DELETED: 'attachment.deleted',
+
+  // SIEM streaming
+  SIEM_DESTINATION_CREATED: 'siem_destination.created',
+  SIEM_DESTINATION_UPDATED: 'siem_destination.updated',
+  SIEM_DESTINATION_DELETED: 'siem_destination.deleted',
+  SIEM_DESTINATION_TEST: 'siem_destination.test',
+
+  // Template
+  TEMPLATE_CREATED: 'template.created',
+  TEMPLATE_UPDATED: 'template.updated',
+  TEMPLATE_DELETED: 'template.deleted',
+
+  // Announcement
+  ANNOUNCEMENT_CREATED: 'announcement.created',
+  ANNOUNCEMENT_UPDATED: 'announcement.updated',
+  ANNOUNCEMENT_ARCHIVED: 'announcement.archived',
+  ANNOUNCEMENT_UNARCHIVED: 'announcement.unarchived',
+  ANNOUNCEMENT_DELETED: 'announcement.deleted',
+
+  // Base
+  BASE_PROPERTY_UPDATED: 'base.property.updated',
+  BASE_FORM_SHARE_UPDATED: 'base.form_share.updated',
 } as const;
 
 export type AuditEventType = (typeof AuditEvent)[keyof typeof AuditEvent];
@@ -107,11 +147,8 @@ export const EXCLUDED_AUDIT_EVENTS: Set<string> = new Set([
   AuditEvent.PAGE_CREATED,
   AuditEvent.PAGE_MOVED_TO_SPACE,
   AuditEvent.PAGE_DUPLICATED,
-  AuditEvent.COMMENT_CREATED,
-  AuditEvent.COMMENT_UPDATED,
-  AuditEvent.COMMENT_RESOLVED,
-  AuditEvent.COMMENT_REOPENED,
-  AuditEvent.ATTACHMENT_UPLOADED
+  AuditEvent.ATTACHMENT_UPLOADED,
+  AuditEvent.SIEM_DESTINATION_TEST,
 ]);
 
 export const AuditResource = {
@@ -124,11 +161,17 @@ export const AuditResource = {
   COMMENT: 'comment',
   SHARE: 'share',
   API_KEY: 'api_key',
+  OAUTH_CLIENT: 'oauth_client',
+  OAUTH_GRANT: 'oauth_grant',
+  INTEGRATION: 'integration',
   SCIM_TOKEN: 'scim_token',
   SSO_PROVIDER: 'sso_provider',
   WORKSPACE_INVITATION: 'workspace_invitation',
   ATTACHMENT: 'attachment',
   LICENSE: 'license',
+  SIEM_DESTINATION: 'siem_destination',
+  TEMPLATE: 'template',
+  ANNOUNCEMENT: 'announcement',
 } as const;
 
 export type AuditResourceType =

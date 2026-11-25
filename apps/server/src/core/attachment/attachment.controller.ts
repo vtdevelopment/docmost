@@ -5,11 +5,13 @@ import {
   ForbiddenException,
   Get,
   HttpCode,
+  HttpException,
   HttpStatus,
   Inject,
   Logger,
   NotFoundException,
   Param,
+  PayloadTooLargeException,
   Post,
   Query,
   Req,
@@ -19,12 +21,20 @@ import {
 } from '@nestjs/common';
 import { AttachmentService } from './services/attachment.service';
 import { FastifyReply, FastifyRequest } from 'fastify';
+import { ModuleRef } from '@nestjs/core';
 import { FileInterceptor } from '../../common/interceptors/file.interceptor';
 import * as bytes from 'bytes';
 import { AuthUser } from '../../common/decorators/auth-user.decorator';
 import { AuthWorkspace } from '../../common/decorators/auth-workspace.decorator';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
-import { Attachment, User, Workspace } from '@docmost/db/types/entity.types';
+import { OAuthScope } from '../../common/decorators/oauth-scope.decorator';
+import {
+  Attachment,
+  Page,
+  Template,
+  User,
+  Workspace,
+} from '@docmost/db/types/entity.types';
 import { StorageService } from '../../integrations/storage/storage.service';
 import {
   getAttachmentFolderPath,
@@ -47,19 +57,29 @@ import {
 } from '../casl/interfaces/workspace-ability.type';
 import WorkspaceAbilityFactory from '../casl/abilities/workspace-ability.factory';
 import { PageRepo } from '@docmost/db/repos/page/page.repo';
+import { TemplateRepo } from '@docmost/db/repos/template/template.repo';
+import { SpaceMemberRepo } from '@docmost/db/repos/space/space-member.repo';
 import { AttachmentRepo } from '@docmost/db/repos/attachment/attachment.repo';
 import { validate as isValidUUID } from 'uuid';
 import { EnvironmentService } from '../../integrations/environment/environment.service';
 import { TokenService } from '../auth/services/token.service';
 import { JwtAttachmentPayload, JwtType } from '../auth/dto/jwt-payload';
 import * as path from 'path';
-import { AttachmentInfoDto, RemoveIconDto } from './dto/attachment.dto';
+import {
+  AttachmentInfoDto,
+  DeleteAttachmentDto,
+  PageIdDto,
+  RemoveIconDto,
+} from './dto/attachment.dto';
+import { PaginationOptions } from '@docmost/db/pagination/pagination-options';
 import { PageAccessService } from '../page/page-access/page-access.service';
+import { DomainService } from '../../integrations/environment/domain.service';
 import { AuditEvent, AuditResource } from '../../common/events/audit-events';
 import {
   AUDIT_SERVICE,
   IAuditService,
 } from '../../integrations/audit/audit.service';
+import { ApiKeyScope } from '../../common/decorators/api-key-scope.decorator';
 
 @Controller()
 export class AttachmentController {
@@ -75,7 +95,11 @@ export class AttachmentController {
     private readonly environmentService: EnvironmentService,
     private readonly tokenService: TokenService,
     private readonly pageAccessService: PageAccessService,
+    private readonly domainService: DomainService,
     @Inject(AUDIT_SERVICE) private readonly auditService: IAuditService,
+    private readonly templateRepo: TemplateRepo,
+    private readonly spaceMemberRepo: SpaceMemberRepo,
+    private readonly moduleRef: ModuleRef,
   ) {}
 
   @UseGuards(JwtAuthGuard)
@@ -98,7 +122,7 @@ export class AttachmentController {
     } catch (err: any) {
       this.logger.error(err.message);
       if (err?.statusCode === 413) {
-        throw new BadRequestException(
+        throw new PayloadTooLargeException(
           `File too large. Exceeds the ${this.environmentService.getFileUploadSizeLimit()} limit`,
         );
       }
@@ -108,55 +132,92 @@ export class AttachmentController {
       throw new BadRequestException('Failed to upload file');
     }
 
-    const pageId = file.fields?.pageId?.value;
+    const pageId = file.fields?.pageId?.value || undefined;
+    const templateId = file.fields?.templateId?.value || undefined;
 
-    if (!pageId) {
+    if (!pageId && !templateId) {
       throw new BadRequestException('PageId is required');
     }
 
-    const page = await this.pageRepo.findById(pageId);
-
-    if (!page) {
-      throw new NotFoundException('Page not found');
+    if (pageId && templateId) {
+      throw new BadRequestException('Use either pageId or templateId');
     }
 
-    await this.pageAccessService.validateCanEdit(page, user);
+    if (templateId && !isValidUUID(templateId)) {
+      throw new BadRequestException('Invalid template id');
+    }
 
-    const spaceId = page.spaceId;
+    let page: Page;
+    let spaceId: string | null;
+    if (templateId) {
+      const template = await this.findEditableTemplate(
+        templateId,
+        user,
+        workspace,
+      );
+      spaceId = template.spaceId;
+    } else {
+      page = await this.pageRepo.findById(pageId);
+
+      if (!page) {
+        throw new NotFoundException('Page not found');
+      }
+
+      await this.pageAccessService.validateCanEdit(page, user);
+
+      spaceId = page.spaceId;
+    }
 
     const attachmentId = file.fields?.attachmentId?.value;
     if (attachmentId && !isValidUUID(attachmentId)) {
       throw new BadRequestException('Invalid attachment id');
     }
 
+    const type = file.fields?.type?.value;
+    const isCover = type === AttachmentType.PageCover;
+    const isFile = type === undefined || type === AttachmentType.File;
+    if ((!isFile && !isCover) || (isCover && (attachmentId || templateId))) {
+      throw new BadRequestException('Invalid attachment type');
+    }
+
     try {
       const fileResponse = await this.attachmentService.uploadFile({
         filePromise: file,
-        pageId: pageId,
+        pageId: page?.id,
+        templateId: templateId,
         spaceId: spaceId,
         userId: user.id,
         workspaceId: workspace.id,
         attachmentId: attachmentId,
+        type: isCover ? AttachmentType.PageCover : AttachmentType.File,
       });
 
       this.auditService.log({
         event: AuditEvent.ATTACHMENT_UPLOADED,
         resourceType: AuditResource.ATTACHMENT,
         resourceId: fileResponse?.id ?? attachmentId,
-        spaceId,
+        spaceId: spaceId ?? undefined,
         metadata: {
           fileName: fileResponse?.fileName,
-          pageId,
+          pageId: page?.id,
+          templateId,
           spaceId,
         },
       });
 
-      return res.send(fileResponse);
+      return res.send({
+        ...fileResponse,
+        url: this.buildFileUrl(workspace, fileResponse),
+      });
     } catch (err: any) {
+      // cover uploads tell the user why they were refused
+      if (isCover && err instanceof HttpException) {
+        throw err;
+      }
       if (err?.statusCode === 413) {
         const errMessage = `File too large. Exceeds the ${this.environmentService.getFileUploadSizeLimit()} limit`;
         this.logger.error(errMessage);
-        throw new BadRequestException(errMessage);
+        throw new PayloadTooLargeException(errMessage);
       }
       this.logger.error(err);
       throw new BadRequestException('Error processing file upload.');
@@ -165,6 +226,7 @@ export class AttachmentController {
 
   @UseGuards(JwtAuthGuard)
   @Get('/files/:fileId/:fileName')
+  @OAuthScope('read')
   async getFile(
     @Req() req: FastifyRequest,
     @Res() res: FastifyReply,
@@ -187,6 +249,10 @@ export class AttachmentController {
       // owns the chat, per AttachmentRepo.claimAttachmentsForChat) can
       // read it back.
       if (attachment.creatorId !== user.id) {
+        throw new NotFoundException();
+      }
+    } else if (attachment.templateId) {
+      if (!(await this.canViewTemplateFile(attachment, user, workspace))) {
         throw new NotFoundException();
       }
     } else {
@@ -277,7 +343,7 @@ export class AttachmentController {
       });
     } catch (err: any) {
       if (err?.statusCode === 413) {
-        throw new BadRequestException(
+        throw new PayloadTooLargeException(
           `File too large. Exceeds the ${MAX_AVATAR_SIZE} limit`,
         );
       }
@@ -296,7 +362,8 @@ export class AttachmentController {
 
     if (
       !validAttachmentTypes.includes(attachmentType) ||
-      attachmentType === AttachmentType.File
+      attachmentType === AttachmentType.File ||
+      attachmentType === AttachmentType.PageCover
     ) {
       throw new BadRequestException('Invalid image attachment type');
     }
@@ -337,6 +404,11 @@ export class AttachmentController {
 
       return res.send(fileResponse);
     } catch (err: any) {
+      if (err?.statusCode === 413) {
+        throw new PayloadTooLargeException(
+          `File too large. Exceeds the ${MAX_AVATAR_SIZE} limit`,
+        );
+      }
       this.logger.error(err);
       throw new BadRequestException('Error processing file upload.');
     }
@@ -351,7 +423,8 @@ export class AttachmentController {
   ) {
     if (
       !validAttachmentTypes.includes(attachmentType) ||
-      attachmentType === AttachmentType.File
+      attachmentType === AttachmentType.File ||
+      attachmentType === AttachmentType.PageCover
     ) {
       throw new BadRequestException('Invalid image attachment type');
     }
@@ -386,6 +459,7 @@ export class AttachmentController {
     }
   }
 
+  @ApiKeyScope('read')
   @UseGuards(JwtAuthGuard)
   @HttpCode(HttpStatus.OK)
   @Post('files/info')
@@ -393,6 +467,72 @@ export class AttachmentController {
     @Body() dto: AttachmentInfoDto,
     @AuthWorkspace() workspace: Workspace,
     @AuthUser() user: User,
+  ) {
+    const attachment = await this.attachmentRepo.findById(dto.attachmentId);
+    if (
+      !attachment ||
+      (!attachment.pageId && !attachment.templateId) ||
+      attachment.workspaceId !== workspace.id ||
+      attachment.type !== AttachmentType.File
+    ) {
+      throw new NotFoundException('File not found');
+    }
+
+    if (attachment.templateId) {
+      if (!(await this.canViewTemplateFile(attachment, user, workspace))) {
+        throw new NotFoundException('File not found');
+      }
+      return { ...attachment, url: this.buildFileUrl(workspace, attachment) };
+    }
+
+    const page = await this.pageRepo.findById(attachment.pageId);
+    if (!page) {
+      throw new NotFoundException('File not found');
+    }
+
+    await this.pageAccessService.validateCanView(page, user);
+
+    return { ...attachment, url: this.buildFileUrl(workspace, attachment) };
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @HttpCode(HttpStatus.OK)
+  @Post('pages/attachments')
+  @OAuthScope('read')
+  async getPageAttachments(
+    @Body() dto: PageIdDto,
+    @Body() pagination: PaginationOptions,
+    @AuthUser() user: User,
+    @AuthWorkspace() workspace: Workspace,
+  ) {
+    const page = await this.pageRepo.findById(dto.pageId);
+    if (!page || page.workspaceId !== workspace.id) {
+      throw new NotFoundException('Page not found');
+    }
+
+    await this.pageAccessService.validateCanView(page, user);
+
+    const result = await this.attachmentRepo.findPageAttachments(
+      page.id,
+      pagination,
+    );
+
+    return {
+      ...result,
+      items: result.items.map((attachment) => ({
+        ...attachment,
+        url: this.buildFileUrl(workspace, attachment),
+      })),
+    };
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @HttpCode(HttpStatus.OK)
+  @Post('attachments/delete')
+  async deleteAttachment(
+    @Body() dto: DeleteAttachmentDto,
+    @AuthUser() user: User,
+    @AuthWorkspace() workspace: Workspace,
   ) {
     const attachment = await this.attachmentRepo.findById(dto.attachmentId);
     if (
@@ -409,9 +549,33 @@ export class AttachmentController {
       throw new NotFoundException('File not found');
     }
 
-    await this.pageAccessService.validateCanView(page, user);
+    await this.pageAccessService.validateCanEdit(page, user);
 
-    return attachment;
+    const spaceAbility = await this.spaceAbility.createForUser(
+      user,
+      page.spaceId,
+    );
+    if (
+      spaceAbility.cannot(SpaceCaslAction.Manage, SpaceCaslSubject.Settings)
+    ) {
+      throw new ForbiddenException('Only space admins can delete files');
+    }
+
+    await this.attachmentService.deleteAttachment(attachment);
+
+    this.auditService.log({
+      event: AuditEvent.ATTACHMENT_DELETED,
+      resourceType: AuditResource.ATTACHMENT,
+      resourceId: attachment.id,
+      spaceId: page.spaceId,
+      changes: {
+        before: {
+          fileName: attachment.fileName,
+          pageId: page.id,
+          creatorId: attachment.creatorId,
+        },
+      },
+    });
   }
 
   @UseGuards(JwtAuthGuard)
@@ -463,6 +627,61 @@ export class AttachmentController {
       await this.attachmentService.removeWorkspaceIcon(workspace);
       return;
     }
+  }
+
+  private buildFileUrl(workspace: Workspace, attachment: Attachment): string {
+    return `${this.domainService.getUrl(workspace.hostname)}/api/files/${attachment.id}/${encodeURIComponent(attachment.fileName)}`;
+  }
+
+  private async findEditableTemplate(
+    templateId: string,
+    user: User,
+    workspace: Workspace,
+  ): Promise<Template> {
+    let TemplateAccessModule: any;
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      TemplateAccessModule = require('./../../ee/template/services/template-access.service');
+    } catch (err) {
+      this.logger.debug(
+        'Template module requested but EE module not bundled in this build',
+      );
+      throw new NotFoundException('Template not found');
+    }
+
+    const templateAccessService = this.moduleRef.get(
+      TemplateAccessModule.TemplateAccessService,
+      { strict: false },
+    );
+    return templateAccessService.findEditableTemplate(
+      templateId,
+      user,
+      workspace,
+    );
+  }
+
+  private async canViewTemplateFile(
+    attachment: Attachment,
+    user: User,
+    workspace: Workspace,
+  ): Promise<boolean> {
+    const template = await this.templateRepo.findById(
+      attachment.templateId,
+      workspace.id,
+    );
+    if (!template) {
+      return false;
+    }
+
+    if (!template.spaceId) {
+      return true;
+    }
+
+    const roles = await this.spaceMemberRepo.getUserSpaceRoles(
+      user.id,
+      template.spaceId,
+    );
+    return Boolean(roles?.length);
   }
 
   private async sendFileResponse(

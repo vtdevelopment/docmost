@@ -1,6 +1,20 @@
 import { IPage } from "@/features/page/types/page.types.ts";
 import { SpaceTreeNode } from "@/features/page/tree/types.ts";
 
+export function findPageInTree(
+  nodes: SpaceTreeNode[],
+  pageId: string | undefined,
+): SpaceTreeNode | undefined {
+  if (!pageId) return;
+  for (const node of nodes) {
+    if (node.slugId === pageId || node.id === pageId) return node;
+    if (node.children?.length) {
+      const child = findPageInTree(node.children, pageId);
+      if (child) return child;
+    }
+  }
+}
+
 export function sortPositionKeys(keys: any[]) {
   return keys.sort((a, b) => {
     if (a.position < b.position) return -1;
@@ -20,6 +34,7 @@ export function buildTree(pages: IPage[]): SpaceTreeNode[] {
       slugId: page.slugId,
       name: page.title,
       icon: page.icon,
+      coverPhoto: page.coverPhoto,
       position: page.position,
       hasChildren: page.hasChildren,
       spaceId: page.spaceId,
@@ -219,4 +234,22 @@ export function mergeRootTrees(
   });
 
   return sortPositionKeys(merged);
+}
+
+export function spaceRoots(
+  tree: SpaceTreeNode[],
+  spaceId: string,
+): SpaceTreeNode[] {
+  return tree.filter((node) => node?.spaceId === spaceId);
+}
+
+export function updateSpaceRoots(
+  tree: SpaceTreeNode[],
+  spaceId: string,
+  update: (roots: SpaceTreeNode[]) => SpaceTreeNode[],
+): SpaceTreeNode[] {
+  const roots = spaceRoots(tree, spaceId);
+  const next = update(roots);
+  if (next === roots) return tree;
+  return [...tree.filter((node) => node?.spaceId !== spaceId), ...next];
 }

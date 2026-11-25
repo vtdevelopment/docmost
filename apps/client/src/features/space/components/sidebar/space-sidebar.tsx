@@ -35,7 +35,7 @@ import clsx from "clsx";
 import { useDisclosure } from "@mantine/hooks";
 import SpaceSettingsModal from "@/features/space/components/settings-modal.tsx";
 import { useGetSpaceBySlugQuery } from "@/features/space/queries/space-query.ts";
-import { getSpaceUrl } from "@/lib/config.ts";
+import { getSpaceUrl, isBetaPublicSpaces } from "@/lib/config.ts";
 import SpaceTree from "@/features/page/tree/components/space-tree.tsx";
 import { useSpaceAbility } from "@/features/space/permissions/use-space-ability.ts";
 import {
@@ -54,10 +54,13 @@ import {
 import { mobileSidebarAtom } from "@/components/layouts/global/hooks/atoms/sidebar-atom.ts";
 import { useToggleSidebar } from "@/components/layouts/global/hooks/hooks/use-toggle-sidebar.ts";
 import { searchSpotlight } from "@/features/search/constants";
-import TemplatePickerModal from "@/ee/template/components/template-picker-modal";
+const TemplatePickerModal = React.lazy(
+  () => import("@/ee/template/components/template-picker-modal"),
+);
 import { useHasFeature } from "@/ee/hooks/use-feature";
 import { useUpgradeLabel } from "@/ee/hooks/use-upgrade-label";
 import { Feature } from "@/ee/features";
+import { useExportDisabled } from "@/ee/security/hooks/use-export-disabled.ts";
 import { ErrorBoundary } from "react-error-boundary";
 
 export function SpaceSidebar() {
@@ -104,6 +107,8 @@ export function SpaceSidebar() {
               spaceName={space?.name}
               spaceSlug={space?.slug}
               spaceIcon={space?.logo}
+              isPublished={isBetaPublicSpaces() && space?.isPublished}
+              isArchived={!!space?.archivedAt}
             />
           </Group>
         </div>
@@ -126,7 +131,7 @@ export function SpaceSidebar() {
                   className={classes.menuItemIcon}
                   stroke={2}
                 />
-                <span>{t("Overview")}</span>
+                <span>{space.homePage ? t("Home") : t("Overview")}</span>
               </div>
             </UnstyledButton>
 
@@ -258,6 +263,7 @@ function SpaceMenu({
   ] = useDisclosure(false);
   const hasTemplates = useHasFeature(Feature.TEMPLATES);
   const upgradeLabel = useUpgradeLabel();
+  const { exportDisabled, exportDisabledLabel } = useExportDisabled(spaceSlug);
 
   const { data: watchStatus } = useSpaceWatchStatusQuery(spaceId);
   const watchMutation = useWatchSpaceMutation();
@@ -359,12 +365,21 @@ function SpaceMenu({
                 {t("Import pages")}
               </Menu.Item>
 
-              <Menu.Item
-                onClick={openExportModal}
-                leftSection={<IconFileExport size={16} />}
+              <Tooltip
+                label={exportDisabledLabel}
+                disabled={!exportDisabled}
+                position="right"
+                withArrow
               >
-                {t("Export space")}
-              </Menu.Item>
+                <Menu.Item
+                  onClick={exportDisabled ? undefined : openExportModal}
+                  leftSection={<IconFileExport size={16} />}
+                  data-disabled={exportDisabled || undefined}
+                  aria-disabled={exportDisabled || undefined}
+                >
+                  {t("Export space")}
+                </Menu.Item>
+              </Tooltip>
 
               <Menu.Divider />
 
@@ -406,11 +421,13 @@ function SpaceMenu({
 
       {hasTemplates && templatePickerOpened && (
         <ErrorBoundary fallbackRender={() => null}>
-          <TemplatePickerModal
-            opened={templatePickerOpened}
-            onClose={closeTemplatePicker}
-            initialSpaceId={spaceId}
-          />
+          <React.Suspense fallback={null}>
+            <TemplatePickerModal
+              opened={templatePickerOpened}
+              onClose={closeTemplatePicker}
+              initialSpaceId={spaceId}
+            />
+          </React.Suspense>
         </ErrorBoundary>
       )}
     </>

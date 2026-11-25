@@ -30,6 +30,26 @@ export type JsonValue = JsonArray | JsonObject | JsonPrimitive;
 
 export type Timestamp = ColumnType<Date, Date | string, Date | string>;
 
+export interface Announcements {
+  archivedAt: Timestamp | null;
+  audience: Generated<string>;
+  color: string;
+  content: Json;
+  createdAt: Generated<Timestamp>;
+  creatorId: string | null;
+  endsAt: Timestamp | null;
+  id: Generated<string>;
+  isDismissible: Generated<boolean>;
+  lastUpdatedById: string | null;
+  startsAt: Generated<Timestamp>;
+  textContent: string;
+  title: string;
+  tsv: string | null;
+  type: string;
+  updatedAt: Generated<Timestamp>;
+  workspaceId: string;
+}
+
 export interface ApiKeys {
   createdAt: Generated<Timestamp>;
   deletedAt: Timestamp | null;
@@ -37,6 +57,7 @@ export interface ApiKeys {
   id: Generated<string>;
   lastUsedAt: Timestamp | null;
   name: string | null;
+  scopes: Generated<Json>;
   updatedAt: Generated<Timestamp>;
   creatorId: string;
   workspaceId: string;
@@ -52,9 +73,11 @@ export interface Attachments {
   filePath: string;
   fileSize: Int8 | null;
   id: Generated<string>;
+  indexedAt: Timestamp | null;
   mimeType: string | null;
   pageId: string | null;
   spaceId: string | null;
+  templateId: string | null;
   textContent: string | null;
   tsv: string | null;
   type: string | null;
@@ -74,6 +97,7 @@ export interface Audit {
   resourceId: string | null;
   resourceType: string;
   spaceId: string | null;
+  userAgent: string | null;
   workspaceId: string;
 }
 
@@ -126,6 +150,13 @@ export interface Backlinks {
   workspaceId: string;
 }
 
+export interface BasePendingConversions {
+  conversionKey: string;
+  createdAt: Generated<Timestamp>;
+  pageId: string;
+  workspaceId: string;
+}
+
 export interface BaseProperties {
   createdAt: Generated<Timestamp>;
   deletedAt: Timestamp | null;
@@ -154,6 +185,18 @@ export interface BaseRows {
   pageId: string;
   position: string;
   updatedAt: Generated<Timestamp>;
+  workspaceId: string;
+}
+
+export interface BaseViewShares {
+  access: Generated<string>;
+  createdAt: Generated<Timestamp>;
+  creatorId: string | null;
+  id: Generated<string>;
+  key: string;
+  pageId: string;
+  updatedAt: Generated<Timestamp>;
+  viewId: string;
   workspaceId: string;
 }
 
@@ -312,7 +355,9 @@ export interface PageHistory {
 export interface Pages {
   content: Json | null;
   contributorIds: Generated<string[] | null>;
+  coverAttribution: Json | null;
   coverPhoto: string | null;
+  coverPosition: number | null;
   createdAt: Generated<Timestamp>;
   creatorId: string | null;
   deletedAt: Timestamp | null;
@@ -333,6 +378,18 @@ export interface Pages {
   updatedAt: Generated<Timestamp>;
   workspaceId: string;
   ydoc: Buffer | null;
+}
+
+export interface PublicSpaces {
+  createdAt: Generated<Timestamp>;
+  creatorId: string | null;
+  enabled: Generated<boolean>;
+  id: Generated<string>;
+  searchIndexing: Generated<boolean>;
+  settings: Json | null;
+  spaceId: string;
+  updatedAt: Generated<Timestamp>;
+  workspaceId: string;
 }
 
 export interface Shares {
@@ -361,12 +418,39 @@ export interface SpaceMembers {
   userId: string | null;
 }
 
+export interface SiemDestinations {
+  config: Json;
+  consecutiveFailures: Generated<number>;
+  createdAt: Generated<Timestamp>;
+  creatorId: string | null;
+  cursorCreatedAt: Generated<Timestamp>;
+  cursorId: Generated<string>;
+  cursorSnapshot: string | null;
+  enabled: Generated<boolean>;
+  failingSince: Timestamp | null;
+  id: Generated<string>;
+  lastDeliveredAt: Timestamp | null;
+  lastError: string | null;
+  lastErrorAt: Timestamp | null;
+  name: string;
+  nextAttemptAt: Timestamp | null;
+  secrets: string;
+  status: Generated<string>;
+  type: string;
+  updatedAt: Generated<Timestamp>;
+  version: Generated<number>;
+  workspaceId: string;
+}
+
 export interface Spaces {
+  archivedAt: Timestamp | null;
+  archivedById: string | null;
   createdAt: Generated<Timestamp>;
   creatorId: string | null;
   defaultRole: Generated<string>;
   deletedAt: Timestamp | null;
   description: string | null;
+  homePageId: string | null;
   id: Generated<string>;
   isPersonal: Generated<boolean>;
   logo: string | null;
@@ -427,9 +511,11 @@ export interface UserTokens {
 export interface WorkspaceInvitations {
   createdAt: Generated<Timestamp>;
   email: string | null;
+  expiresAt: Timestamp;
   groupIds: string[] | null;
   id: Generated<string>;
   invitedById: string | null;
+  message: string | null;
   role: string;
   token: string;
   updatedAt: Generated<Timestamp>;
@@ -506,6 +592,34 @@ export interface Watchers {
   createdAt: Generated<Timestamp>;
 }
 
+export interface Integrations {
+  id: Generated<string>;
+  workspaceId: string;
+  type: string;
+  settings: Json | null;
+  installedById: string | null;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Generated<Timestamp>;
+  deletedAt: Timestamp | null;
+}
+
+export interface IntegrationConnections {
+  id: Generated<string>;
+  integrationId: string;
+  userId: string;
+  workspaceId: string;
+  providerUserId: string | null;
+  accessToken: string | null;
+  refreshToken: string | null;
+  tokenExpiresAt: Timestamp | null;
+  invalidatedAt: Timestamp | null;
+  scopes: string | null;
+  kind: string;
+  metadata: Json | null;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Generated<Timestamp>;
+}
+
 export interface Labels {
   id: Generated<string>;
   name: string;
@@ -562,6 +676,10 @@ export interface PageVerifications {
   rejectedAt: Timestamp | null;
   rejectedById: string | null;
   rejectionComment: string | null;
+  invalidatedAt: Timestamp | null;
+  invalidatedById: string | null;
+  verifiedHistoryId: string | null;
+  rejectedHistoryId: string | null;
   data: Json | null;
   creatorId: string | null;
   createdAt: Generated<Timestamp>;
@@ -636,17 +754,77 @@ export interface UserSessions {
   createdAt: Generated<Timestamp>;
 }
 
+export interface OauthAuthorizationCodes {
+  clientId: string;
+  codeChallenge: string | null;
+  codeChallengeMethod: string | null;
+  codeHash: string;
+  consumedAt: Timestamp | null;
+  createdAt: Generated<Timestamp>;
+  expiresAt: Timestamp;
+  id: Generated<string>;
+  redirectUri: string;
+  scopes: Json;
+  userId: string;
+  workspaceId: string;
+}
+
+export interface OauthClients {
+  clientUri: string | null;
+  createdAt: Generated<Timestamp>;
+  deletedAt: Timestamp | null;
+  grantTypes: Json;
+  id: Generated<string>;
+  isDynamic: Generated<boolean>;
+  logoUri: string | null;
+  name: string;
+  redirectUris: Json;
+  scopes: Json;
+  secretHash: string | null;
+  tokenEndpointAuthMethod: Generated<string>;
+  updatedAt: Generated<Timestamp>;
+  workspaceId: string;
+}
+
+export interface OauthGrants {
+  clientId: string;
+  createdAt: Generated<Timestamp>;
+  id: Generated<string>;
+  lastUsedAt: Timestamp | null;
+  revokedAt: Timestamp | null;
+  scopes: Json;
+  updatedAt: Generated<Timestamp>;
+  userId: string;
+  workspaceId: string;
+}
+
+export interface OauthTokens {
+  accessExpiresAt: Timestamp;
+  accessTokenJti: string;
+  createdAt: Generated<Timestamp>;
+  grantId: string;
+  id: Generated<string>;
+  refreshExpiresAt: Timestamp | null;
+  refreshTokenHash: string | null;
+  revokedAt: Timestamp | null;
+  scopes: Json;
+  workspaceId: string;
+}
+
 export interface DB {
   aiChats: AiChats;
   aiChatMessages: AiChatMessages;
+  announcements: Announcements;
   apiKeys: ApiKeys;
   attachments: Attachments;
   audit: Audit;
   authAccounts: AuthAccounts;
   authProviders: AuthProviders;
   backlinks: Backlinks;
+  basePendingConversions: BasePendingConversions;
   baseProperties: BaseProperties;
   baseRows: BaseRows;
+  baseViewShares: BaseViewShares;
   baseViews: BaseViews;
   billing: Billing;
   comments: Comments;
@@ -654,6 +832,8 @@ export interface DB {
   fileTasks: FileTasks;
   groups: Groups;
   groupUsers: GroupUsers;
+  integrationConnections: IntegrationConnections;
+  integrations: Integrations;
   labels: Labels;
   notifications: Notifications;
   pageAccess: PageAccess;
@@ -665,8 +845,10 @@ export interface DB {
   pageVerifications: PageVerifications;
   pageVerifiers: PageVerifiers;
   pages: Pages;
+  publicSpaces: PublicSpaces;
   scimTokens: ScimTokens;
   shares: Shares;
+  siemDestinations: SiemDestinations;
   spaceMembers: SpaceMembers;
   spaces: Spaces;
   templates: Templates;
@@ -677,4 +859,8 @@ export interface DB {
   watchers: Watchers;
   workspaceInvitations: WorkspaceInvitations;
   workspaces: Workspaces;
+  oauthAuthorizationCodes: OauthAuthorizationCodes;
+  oauthClients: OauthClients;
+  oauthGrants: OauthGrants;
+  oauthTokens: OauthTokens;
 }

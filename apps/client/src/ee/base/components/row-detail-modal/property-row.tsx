@@ -17,6 +17,7 @@ type PropertyRowProps = {
   onMenuOpenChange: (opened: boolean) => void;
   onMenuDirtyChange: (dirty: boolean) => void;
   onUpdate: (propertyId: string, value: unknown) => void;
+  onEditingChange?: (editing: boolean) => void;
   autoFocusValue?: boolean;
   onAutoFocused?: () => void;
 };
@@ -29,6 +30,7 @@ export function PropertyRow({
   onMenuOpenChange,
   onMenuDirtyChange,
   onUpdate,
+  onEditingChange,
   autoFocusValue,
   onAutoFocused,
 }: PropertyRowProps) {
@@ -76,6 +78,7 @@ export function PropertyRow({
           closeOnClickOutside={false}
           closeOnEscape={false}
           hideDetached={false}
+          preventPositionChangeWhenVisible={false}
         >
           <Popover.Target>
             <button
@@ -112,6 +115,7 @@ export function PropertyRow({
         row={row}
         readOnly={!canEdit}
         onUpdate={onUpdate}
+        onEditingChange={onEditingChange}
       />
     </div>
   );

@@ -3,8 +3,22 @@ import { ThrottlerModule } from '@nestjs/throttler';
 import { ThrottlerStorageRedisService } from '@nest-lab/throttler-storage-redis';
 import { EnvironmentService } from '../environment/environment.service';
 import { EnvironmentModule } from '../environment/environment.module';
-import { parseRedisUrl } from '../../common/helpers';
-import { AUTH_THROTTLER, AI_CHAT_THROTTLER } from './throttler-names';
+import { createRetryStrategy, parseRedisUrl } from '../../common/helpers';
+import {
+  AUTH_THROTTLER,
+  AI_CHAT_THROTTLER,
+  OAUTH_REGISTER_THROTTLER,
+  OAUTH_TOKEN_THROTTLER,
+  OAUTH_AUTHORIZE_THROTTLER,
+  SIEM_TEST_THROTTLER,
+  UNFURL_THROTTLER,
+  CLOUD_EMAIL_THROTTLER,
+  BASE_FORM_SUBMIT_THROTTLER,
+  BASE_FORM_INFO_THROTTLER,
+  MICROSOFT_GRAPH_THROTTLER,
+  UNSPLASH_THROTTLER,
+  TEMPLATE_USE_THROTTLER,
+} from './throttler-names';
 import Redis from 'ioredis';
 
 @Module({
@@ -18,15 +32,29 @@ import Redis from 'ioredis';
           throttlers: [
             { name: AUTH_THROTTLER, ttl: 60_000, limit: 10 },
             { name: AI_CHAT_THROTTLER, ttl: 60_000, limit: 25 },
+            { name: OAUTH_REGISTER_THROTTLER, ttl: 3_600_000, limit: 10 },
+            { name: OAUTH_TOKEN_THROTTLER, ttl: 60_000, limit: 60 },
+            { name: OAUTH_AUTHORIZE_THROTTLER, ttl: 60_000, limit: 30 },
+            { name: SIEM_TEST_THROTTLER, ttl: 60_000, limit: 10 },
+            { name: UNFURL_THROTTLER, ttl: 60_000, limit: 120 },
+            { name: CLOUD_EMAIL_THROTTLER, ttl: 60_000, limit: 5 },
+            { name: BASE_FORM_SUBMIT_THROTTLER, ttl: 60_000, limit: 30 },
+            { name: BASE_FORM_INFO_THROTTLER, ttl: 60_000, limit: 120 },
+            { name: MICROSOFT_GRAPH_THROTTLER, ttl: 60_000, limit: 120 },
+            { name: UNSPLASH_THROTTLER, ttl: 60_000, limit: 30 },
+            { name: TEMPLATE_USE_THROTTLER, ttl: 60_000, limit: 20 },
           ],
           errorMessage: 'Too many requests',
           storage: new ThrottlerStorageRedisService(
             new Redis({
               host: redisConfig.host,
               port: redisConfig.port,
+              username: redisConfig.username,
               password: redisConfig.password,
               db: redisConfig.db,
               family: redisConfig.family,
+              tls: redisConfig.tls,
+              retryStrategy: createRetryStrategy(),
               keyPrefix: 'throttle:',
             }),
           ),

@@ -8,6 +8,7 @@ import {
   UpdatableSpace,
 } from '@docmost/db/types/entity.types';
 import { ExpressionBuilder, sql } from 'kysely';
+import { jsonObjectFrom } from 'kysely/helpers/postgres';
 import { PaginationOptions } from '../../pagination/pagination-options';
 import { executeWithCursorPagination } from '@docmost/db/pagination/cursor-pagination';
 import { DB } from '@docmost/db/types/db';
@@ -25,7 +26,12 @@ export class SpaceRepo {
   async findById(
     spaceId: string,
     workspaceId: string,
-    opts?: { includeMemberCount?: boolean; trx?: KyselyTransaction },
+    opts?: {
+      includeMemberCount?: boolean;
+      includeArchivedBy?: boolean;
+      withLock?: boolean;
+      trx?: KyselyTransaction;
+    },
   ): Promise<Space> {
     const db = dbOrTx(this.db, opts?.trx);
 
@@ -33,6 +39,8 @@ export class SpaceRepo {
       .selectFrom('spaces')
       .selectAll('spaces')
       .$if(opts?.includeMemberCount, (qb) => qb.select(this.withMemberCount))
+      .$if(opts?.includeArchivedBy, (qb) => qb.select(this.withArchivedBy))
+      .select((eb) => this.withIsPublished(eb))
       .where('workspaceId', '=', workspaceId);
 
     if (isValidUUID(spaceId)) {
@@ -40,6 +48,11 @@ export class SpaceRepo {
     } else {
       query = query.where(sql`LOWER(slug)`, '=', sql`LOWER(${spaceId})`);
     }
+
+    if (opts?.withLock && opts?.trx) {
+      query = query.forUpdate();
+    }
+
     return query.executeTakeFirst();
   }
 
@@ -52,8 +65,22 @@ export class SpaceRepo {
       .selectFrom('spaces')
       .selectAll('spaces')
       .$if(opts?.includeMemberCount, (qb) => qb.select(this.withMemberCount))
+      .select((eb) => this.withIsPublished(eb))
       .where(sql`LOWER(slug)`, '=', sql`LOWER(${slug})`)
       .where('workspaceId', '=', workspaceId)
+      .executeTakeFirst();
+  }
+
+  async findSettingsWithWorkspace(spaceId: string, workspaceId: string) {
+    return this.db
+      .selectFrom('spaces')
+      .innerJoin('workspaces', 'workspaces.id', 'spaces.workspaceId')
+      .select([
+        'spaces.settings as spaceSettings',
+        'workspaces.settings as workspaceSettings',
+      ])
+      .where('spaces.id', '=', spaceId)
+      .where('spaces.workspaceId', '=', workspaceId)
       .executeTakeFirst();
   }
 
@@ -71,6 +98,15 @@ export class SpaceRepo {
       .where('isPersonal', '=', true)
       .where('deletedAt', 'is', null)
       .executeTakeFirst();
+  }
+
+  async isArchived(spaceId: string): Promise<boolean> {
+    const row = await this.db
+      .selectFrom('spaces')
+      .select('archivedAt')
+      .where('id', '=', spaceId)
+      .executeTakeFirst();
+    return Boolean(row?.archivedAt);
   }
 
   async slugExists(
@@ -127,6 +163,28 @@ export class SpaceRepo {
       .executeTakeFirst();
   }
 
+  async updateExportSettings(
+    spaceId: string,
+    workspaceId: string,
+    prefKey: string,
+    prefValue: string | boolean,
+    trx?: KyselyTransaction,
+  ) {
+    const db = dbOrTx(this.db, trx);
+    return db
+      .updateTable('spaces')
+      .set({
+        settings: sql`COALESCE(settings, '{}'::jsonb)
+          || jsonb_build_object('export', COALESCE(settings->'export', '{}'::jsonb)
+          || jsonb_build_object('${sql.raw(prefKey)}', ${sql.lit(prefValue)}))`,
+        updatedAt: new Date(),
+      })
+      .where('id', '=', spaceId)
+      .where('workspaceId', '=', workspaceId)
+      .returningAll()
+      .executeTakeFirst();
+  }
+
   async updateCommentSettings(
     spaceId: string,
     workspaceId: string,
@@ -170,6 +228,7 @@ export class SpaceRepo {
       .selectFrom('spaces')
       .selectAll('spaces')
       .select((eb) => [this.withMemberCount(eb)])
+      .select((eb) => this.withIsPublished(eb))
       .where('workspaceId', '=', workspaceId);
 
     if (pagination.query) {
@@ -221,6 +280,27 @@ export class SpaceRepo {
       .as('memberCount');
   }
 
+  withIsPublished(eb: ExpressionBuilder<DB, 'spaces'>) {
+    return eb
+      .exists(
+        eb
+          .selectFrom('publicSpaces')
+          .select('publicSpaces.id')
+          .whereRef('publicSpaces.spaceId', '=', 'spaces.id')
+          .where('publicSpaces.enabled', '=', true),
+      )
+      .as('isPublished');
+  }
+
+  withArchivedBy(eb: ExpressionBuilder<DB, 'spaces'>) {
+    return jsonObjectFrom(
+      eb
+        .selectFrom('users')
+        .select(['users.id', 'users.name', 'users.avatarUrl'])
+        .whereRef('users.id', '=', 'spaces.archivedById'),
+    ).as('archivedBy');
+  }
+
   async deleteSpace(spaceId: string, workspaceId: string): Promise<void> {
     await this.db
       .deleteFrom('spaces')
@@ -230,6 +310,7 @@ export class SpaceRepo {
 
     this.eventEmitter.emit(EventName.SPACE_DELETED, {
       spaceId,
+      workspaceId,
     });
   }
 }

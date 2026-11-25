@@ -26,10 +26,21 @@ import {
   ITableOptions,
   ITableRowOptions,
   IPropertiesOptions,
+  WidthType,
 } from 'docx';
 import { imageDimensionsFromData } from 'image-dimensions';
 import { createNumbering, NumberingStyles } from './numbering';
-import { buildDoc, createShortId } from './utils';
+import {
+  BLANK_PNG,
+  buildDoc,
+  CELL_MARGIN,
+  createShortId,
+  docxImageFromData,
+  getImageWidth,
+  getTableCellWidths,
+  getTableColumnWidths,
+  TEXT_WIDTH,
+} from './utils';
 import { IFootnotes, INumbering, Mutable, SectionConfig, SerializationState } from './types';
 
 // This is duplicated from @curvenote/schema
@@ -337,7 +348,9 @@ export class DocxSerializerState {
     const { getCellOptions, getRowOptions, tableOptions } = opts;
     const actualChildren = this.children;
     const rows: TableRow[] = [];
-    node.content.forEach((row) => {
+    const columnWidths = getTableColumnWidths(node);
+    const cellWidths = getTableCellWidths(node, columnWidths);
+    node.content.forEach((row, _rowOffset, rowIndex) => {
       const cells: TableCell[] = [];
       // Check if all cells are headers in this row
       let tableHeader = true;
@@ -348,10 +361,13 @@ export class DocxSerializerState {
       });
       // This scales images inside of tables
       this.maxImageWidth = MAX_IMAGE_WIDTH / row.content.childCount;
-      row.content.forEach((cell) => {
+      row.content.forEach((cell, _cellOffset, cellIndex) => {
         this.children = [];
         this.renderContent(cell);
-        const tableCellOpts: Mutable<ITableCellOptions> = { children: this.children };
+        const tableCellOpts: Mutable<ITableCellOptions> = {
+          children: this.children,
+          width: { size: cellWidths[rowIndex][cellIndex], type: WidthType.DXA },
+        };
         const colspan = cell.attrs.colspan ?? 1;
         const rowspan = cell.attrs.rowspan ?? 1;
         if (colspan > 1) tableCellOpts.columnSpan = colspan;
@@ -366,7 +382,13 @@ export class DocxSerializerState {
       rows.push(new TableRow({ ...(getRowOptions?.(row) || {}), children: cells, tableHeader }));
     });
     this.maxImageWidth = MAX_IMAGE_WIDTH;
-    const table = new Table({ ...tableOptions, rows });
+    const table = new Table({
+      width: { size: TEXT_WIDTH, type: WidthType.DXA },
+      columnWidths,
+      margins: { left: CELL_MARGIN, right: CELL_MARGIN },
+      ...tableOptions,
+      rows,
+    });
     actualChildren.push(table);
     // If there are multiple tables, this seperates them
     actualChildren.push(new Paragraph(''));
@@ -526,6 +548,9 @@ export class DocxSerializerStateAsync {
 
   currentNumbering?: { reference: string; level: number };
 
+  // numbered lists around the list being rendered
+  numberedListDepth = 0;
+
   constructor(nodes: NodeSerializerAsync, marks: MarkSerializer, options: OptionsAsync) {
     this.nodes = nodes;
     this.marks = marks;
@@ -556,9 +581,17 @@ export class DocxSerializerStateAsync {
 
   async render(node: Node, parent: Node, index: number) {
     if (typeof parent === 'number') throw new Error('!');
-    if (!this.nodes[node.type.name])
-      throw new Error(`Token type \`${node.type.name}\` not supported by Word renderer`);
-    await Promise.resolve(this.nodes[node.type.name](this, node, parent, index));
+    if (this.nodes[node.type.name]) {
+      await Promise.resolve(this.nodes[node.type.name](this, node, parent, index));
+      return;
+    }
+    // node types without a serializer export their content instead of failing the export
+    if (node.isTextblock) {
+      await this.renderInline(node);
+      this.closeBlock(node);
+      return;
+    }
+    await this.renderContent(node);
   }
 
   renderMarks(node: Node, marks: Mark[]): IRunOptions {
@@ -626,22 +659,17 @@ export class DocxSerializerStateAsync {
     closeLink();
   }
 
+  // Every list gets its own numbering, so a nested list keeps its kind and restarts its count.
   async renderList(node: Node, style: NumberingStyles) {
-    if (!this.currentNumbering) {
-      const nextId = createShortId();
-      this.numbering.push(createNumbering(nextId, style));
-      this.currentNumbering = { reference: nextId, level: 0 };
-    } else {
-      const { reference, level } = this.currentNumbering;
-      this.currentNumbering = { reference, level: level + 1 };
-    }
+    const parent = this.currentNumbering;
+    const level = parent ? parent.level + 1 : 0;
+    const reference = createShortId();
+    this.numbering.push(createNumbering(reference, style, level, this.numberedListDepth));
+    this.currentNumbering = { reference, level };
+    if (style === 'numbered') this.numberedListDepth += 1;
     await this.renderContent(node);
-    if (this.currentNumbering.level === 0) {
-      delete this.currentNumbering;
-    } else {
-      const { reference, level } = this.currentNumbering;
-      this.currentNumbering = { reference, level: level - 1 };
-    }
+    if (style === 'numbered') this.numberedListDepth -= 1;
+    this.currentNumbering = parent;
   }
 
   // This is a pass through to the paragraphs, etc. underneath they will close the block
@@ -697,36 +725,25 @@ export class DocxSerializerStateAsync {
   // not sure what this actually is, seems to be close for 8.5x11
   maxImageWidth = MAX_IMAGE_WIDTH;
 
-  async image(
-    src: string,
-    widthPercent = 70,
-    align: AlignOptions = 'center',
-    imageRunOpts?: IImageOptions,
-    imageType?: ImageType,
-  ) {
+  async image(src: string, width?: number | string | null, align: AlignOptions = 'center') {
     const buffer = await Promise.resolve(this.options.getImageBuffer(src));
-    const dimensions = imageDimensionsFromData(buffer);
+    const image = docxImageFromData(buffer);
     /* If the image is not a valid image, don't add it */
-    if (!dimensions) return;
-    const aspect = dimensions.height / dimensions.width;
-    const width = this.maxImageWidth * (widthPercent / 100);
-    let it;
-    try {
-      it = imageType || (src.replace(/.*\./, '').toLowerCase() as any);
-    } catch (e) {
-      it = 'png';
-    }
+    if (!image) return;
+    const aspect = image.height / image.width;
+    const imageWidth = getImageWidth(width, image.width, this.maxImageWidth);
+    const transformation = { width: imageWidth, height: imageWidth * aspect };
     this.current.push(
-      new ImageRun({
-        data: buffer,
-        ...imageRunOpts,
-        type: it,
-        transformation: {
-          ...(imageRunOpts?.transformation || {}),
-          width,
-          height: width * aspect,
-        },
-      }),
+      new ImageRun(
+        image.type === 'svg'
+          ? {
+              type: 'svg',
+              data: buffer,
+              fallback: { type: 'png', data: BLANK_PNG },
+              transformation,
+            }
+          : { type: image.type, data: buffer, transformation },
+      ),
     );
     let alignment: string;
     switch (align) {
@@ -755,6 +772,8 @@ export class DocxSerializerStateAsync {
     const { getCellOptions, getRowOptions, tableOptions } = opts;
     const actualChildren = this.children;
     const rows: TableRow[] = [];
+    const columnWidths = getTableColumnWidths(node);
+    const cellWidths = getTableCellWidths(node, columnWidths);
 
     for (let rowIndex = 0; rowIndex < node.content.childCount; rowIndex += 1) {
       const row = node.content.child(rowIndex);
@@ -778,7 +797,10 @@ export class DocxSerializerStateAsync {
         this.children = [];
         // eslint-disable-next-line no-await-in-loop
         await this.renderContent(cell); // Ensure order
-        const tableCellOpts: Mutable<ITableCellOptions> = { children: this.children };
+        const tableCellOpts: Mutable<ITableCellOptions> = {
+          children: this.children,
+          width: { size: cellWidths[rowIndex][cellIndex], type: WidthType.DXA },
+        };
         const colspan = cell.attrs.colspan ?? 1;
         const rowspan = cell.attrs.rowspan ?? 1;
         if (colspan > 1) tableCellOpts.columnSpan = colspan;
@@ -795,7 +817,13 @@ export class DocxSerializerStateAsync {
     }
 
     this.maxImageWidth = MAX_IMAGE_WIDTH;
-    const table = new Table({ ...tableOptions, rows });
+    const table = new Table({
+      width: { size: TEXT_WIDTH, type: WidthType.DXA },
+      columnWidths,
+      margins: { left: CELL_MARGIN, right: CELL_MARGIN },
+      ...tableOptions,
+      rows,
+    });
     actualChildren.push(table);
     // If there are multiple tables, this separates them
     actualChildren.push(new Paragraph(''));
@@ -824,11 +852,36 @@ export class DocxSerializerStateAsync {
     this.current.push(new FootnoteReferenceRun(this.$footnoteCounter));
   }
 
+  // Fills the footnote body for an already-referenced footnote number from a
+  // node holding block content (Docmost keeps footnote text in a trailing
+  // list, separate from the inline reference).
+  async footnoteDefinition(node: Node, number: number) {
+    const { current, children, nextRunOpts, nextParentParagraphOpts } = this;
+    this.current = [];
+    this.children = [];
+    delete this.nextRunOpts;
+    delete this.nextParentParagraphOpts;
+
+    await this.renderContent(node);
+    this.footnotes[number] = {
+      children: this.children.filter(
+        (child): child is Paragraph => child instanceof Paragraph,
+      ),
+    };
+
+    this.current = current;
+    this.children = children;
+    this.nextRunOpts = nextRunOpts;
+    this.nextParentParagraphOpts = nextParentParagraphOpts;
+  }
+
   closeBlock(node: Node, props?: IParagraphOptions) {
+    const opts = { ...this.nextParentParagraphOpts, ...props };
     const paragraph = new Paragraph({
       children: this.current,
-      ...this.nextParentParagraphOpts,
-      ...props,
+      ...opts,
+      // a paragraph takes one style, so a heading drops the quote or callout style
+      style: opts.heading ? undefined : opts.style,
     });
     this.current = [];
     delete this.nextParentParagraphOpts;
